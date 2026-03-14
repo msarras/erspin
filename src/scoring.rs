@@ -284,6 +284,161 @@ pub fn best_config_score(
     (best_score, best_idx)
 }
 
+/// Score configs directly against sequence data at a given position (DMP).
+///
+/// This avoids precomputing score tables for all gap variants, which is
+/// prohibitively expensive when helices have large distance ranges.
+///
+/// Optimization: identifies elements whose (position, gap) is identical
+/// across all configs ("fixed") and scores them once. Only elements that
+/// vary across configs are re-scored per-config.
+///
+/// Returns (best_score, best_config_index).
+pub fn score_configs_direct(
+    seq: &[u8],
+    pattern: &Pattern,
+    mask: &ResolvedMask,
+    seq_pos: usize,
+) -> (f64, usize) {
+    if mask.configs.is_empty() {
+        return (f64::NEG_INFINITY, 0);
+    }
+
+    let ref0 = &mask.configs[0];
+
+    // Identify fixed strands: same (bgn, gaps) across all configs.
+    let st_fixed: Vec<bool> = (0..mask.st_indices.len())
+        .map(|s| {
+            mask.configs
+                .iter()
+                .all(|c| c.st_bgn[s] == ref0.st_bgn[s] && c.st_gaps[s] == ref0.st_gaps[s])
+        })
+        .collect();
+
+    // Identify fixed helices: same (bgn, gaps) across all configs.
+    let hx_fixed: Vec<bool> = (0..mask.hx_indices.len())
+        .map(|h| {
+            mask.configs
+                .iter()
+                .all(|c| c.hx_bgn[h] == ref0.hx_bgn[h] && c.hx_gaps[h] == ref0.hx_gaps[h])
+        })
+        .collect();
+
+    // Score fixed elements once.
+    let mut fixed_score = 0.0f64;
+    let mut fixed_valid = true;
+
+    for (s, &st_idx) in mask.st_indices.iter().enumerate() {
+        if !st_fixed[s] {
+            continue;
+        }
+        let strand = &pattern.strands[st_idx];
+        let pos = seq_pos + ref0.st_bgn[s];
+        let len = strand.min_len + ref0.st_gaps[s];
+        if pos + len > seq.len() {
+            fixed_valid = false;
+            break;
+        }
+        let mut s_score = 0.0f64;
+        for j in 0..len {
+            let code = nt_strand_code(seq[pos + j]);
+            s_score += strand.profile[code][j] as f64;
+        }
+        fixed_score += s_score;
+    }
+
+    if fixed_valid {
+        for (h, &hx_idx) in mask.hx_indices.iter().enumerate() {
+            if !hx_fixed[h] {
+                continue;
+            }
+            let helix = &pattern.helices[hx_idx];
+            let pos5 = seq_pos + ref0.hx_bgn[h];
+            let dist = helix.min_dist + ref0.hx_gaps[h];
+            let pos3 = pos5 + helix.helix_len + dist;
+            if pos3 + helix.helix_len > seq.len() {
+                fixed_valid = false;
+                break;
+            }
+            let mut h_score = 0.0f64;
+            for j in 0..helix.helix_len {
+                let b5 = seq[pos5 + j];
+                let b3 = seq[pos3 + helix.helix_len - 1 - j];
+                let code = nt_helix_code(b5, b3);
+                h_score += helix.profile[code][j] as f64;
+            }
+            fixed_score += h_score;
+        }
+    }
+
+    if !fixed_valid {
+        return (f64::NEG_INFINITY, 0);
+    }
+
+    // Score variable elements per-config.
+    let mut best_score = f64::NEG_INFINITY;
+    let mut best_idx = 0;
+
+    for (cfg_idx, cfg) in mask.configs.iter().enumerate() {
+        if seq_pos + cfg.len > seq.len() {
+            continue;
+        }
+
+        let mut score = fixed_score;
+        let mut valid = true;
+
+        for (s, &st_idx) in mask.st_indices.iter().enumerate() {
+            if st_fixed[s] {
+                continue;
+            }
+            let strand = &pattern.strands[st_idx];
+            let pos = seq_pos + cfg.st_bgn[s];
+            let len = strand.min_len + cfg.st_gaps[s];
+            if pos + len > seq.len() {
+                valid = false;
+                break;
+            }
+            let mut s_score = 0.0f64;
+            for j in 0..len {
+                let code = nt_strand_code(seq[pos + j]);
+                s_score += strand.profile[code][j] as f64;
+            }
+            score += s_score;
+        }
+
+        if valid {
+            for (h, &hx_idx) in mask.hx_indices.iter().enumerate() {
+                if hx_fixed[h] {
+                    continue;
+                }
+                let helix = &pattern.helices[hx_idx];
+                let pos5 = seq_pos + cfg.hx_bgn[h];
+                let dist = helix.min_dist + cfg.hx_gaps[h];
+                let pos3 = pos5 + helix.helix_len + dist;
+                if pos3 + helix.helix_len > seq.len() {
+                    valid = false;
+                    break;
+                }
+                let mut h_score = 0.0f64;
+                for j in 0..helix.helix_len {
+                    let b5 = seq[pos5 + j];
+                    let b3 = seq[pos3 + helix.helix_len - 1 - j];
+                    let code = nt_helix_code(b5, b3);
+                    h_score += helix.profile[code][j] as f64;
+                }
+                score += h_score;
+            }
+        }
+
+        if valid && score > best_score {
+            best_score = score;
+            best_idx = cfg_idx;
+        }
+    }
+
+    (best_score, best_idx)
+}
+
 /// Score a single training set sequence against a mask.
 /// Used for threshold computation.
 pub fn score_training_sequence(

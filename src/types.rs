@@ -134,6 +134,8 @@ pub struct Config {
     pub hx_bgn: Vec<usize>,
     /// Gap variant for each mask helix (distance variation).
     pub hx_gaps: Vec<usize>,
+    /// Per-atom gap assignments (indexed by atom index in pattern).
+    pub atom_gaps: Vec<usize>,
 }
 
 /// A resolved mask with element indices and precomputed configurations.
@@ -278,4 +280,6 @@ pub struct Hit {
     pub direction: StrandDirection,
     /// Gap configuration index.
     pub config_index: usize,
+    /// Per-atom gap assignments from the winning config (for DMP propagation).
+    pub atom_gaps: Vec<usize>,
 }

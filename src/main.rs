@@ -24,27 +24,29 @@ enum Commands {
     /// Search for RNA motifs in a sequence database.
     Search {
         /// Training set file (.epn format).
-        #[arg(short = 't', long)]
         training_set: String,
 
         /// Database file (FASTA format).
-        #[arg(short = 'd', long)]
         database: String,
 
-        /// Region specification (e.g., -2,2).
-        #[arg(short = 'r', long, allow_hyphen_values = true)]
+        /// Region specification (e.g., 1,23 or -2,2).
+        #[arg(allow_hyphen_values = true)]
         region: String,
 
-        /// Mask levels, separated by '/'. Use '*' for all remaining elements,
-        /// '!' prefix for umask, '+' prefix to add to previous level.
-        /// Example: "6,8 / !2,3 / *"
-        #[arg(short = 'l', long)]
-        levels: String,
+        /// Mask level elements (comma-separated). Each --add starts a new level.
+        /// First group is the initial mask, subsequent groups add elements cumulatively.
+        /// Example: --add 2,4,5,6 --add 3,8,9,10
+        #[arg(long = "add")]
+        add: Vec<String>,
 
-        /// Cutoff thresholds per level, comma-separated.
-        /// Values can be percentages (e.g., "100%") or raw scores.
-        #[arg(short = 'c', long, default_value = "100%")]
-        cutoffs: String,
+        /// Cutoff thresholds per level (raw scores or percentages like 100%).
+        /// Example: --cutoff 10 15 30
+        #[arg(long, num_args = 1..)]
+        cutoff: Option<Vec<String>>,
+
+        /// Minimum log-odds value for zero-count positions.
+        #[arg(long, default_value = "-20.0", allow_hyphen_values = true)]
+        logzero: f64,
 
         /// Mask processing strategy.
         #[arg(long, default_value = "dynamic", value_parser = parse_mask_processing)]
@@ -69,47 +71,48 @@ enum Commands {
         /// Output format.
         #[arg(long, default_value = "text", value_parser = ["text", "json", "tsv"])]
         format: String,
+
+        /// Number of threads to use for parallel search.
+        #[arg(long, default_value = "4")]
+        cpu: usize,
     },
 
     /// View training set structure and alignment.
     View {
         /// Training set file (.epn format).
-        #[arg(short = 't', long)]
         training_set: String,
 
         /// Region specification (e.g., -2,2).
-        #[arg(short = 'r', long, allow_hyphen_values = true)]
+        #[arg(allow_hyphen_values = true)]
         region: Option<String>,
     },
 
     /// Show score statistics for the training set.
     Stats {
         /// Training set file (.epn format).
-        #[arg(short = 't', long)]
         training_set: String,
 
         /// Region specification.
-        #[arg(short = 'r', long, allow_hyphen_values = true)]
+        #[arg(allow_hyphen_values = true)]
         region: String,
 
-        /// Mask levels.
-        #[arg(short = 'l', long)]
-        levels: String,
+        /// Mask level elements (comma-separated). Each --add starts a new level.
+        #[arg(long = "add")]
+        add: Vec<String>,
     },
 
     /// Calculate E-values for given cutoffs.
     Eval {
         /// Training set file (.epn format).
-        #[arg(short = 't', long)]
         training_set: String,
 
         /// Region specification.
-        #[arg(short = 'r', long, allow_hyphen_values = true)]
+        #[arg(allow_hyphen_values = true)]
         region: String,
 
-        /// Mask levels.
-        #[arg(short = 'l', long)]
-        levels: String,
+        /// Mask level elements (comma-separated). Each --add starts a new level.
+        #[arg(long = "add")]
+        add: Vec<String>,
 
         /// Database size in megabases (default: 1.0).
         #[arg(short = 'm', long, default_value = "1.0")]
@@ -123,16 +126,15 @@ enum Commands {
     /// Estimate memory usage and configuration counts.
     Configs {
         /// Training set file (.epn format).
-        #[arg(short = 't', long)]
         training_set: String,
 
         /// Region specification.
-        #[arg(short = 'r', long, allow_hyphen_values = true)]
+        #[arg(allow_hyphen_values = true)]
         region: String,
 
-        /// Mask levels.
-        #[arg(short = 'l', long)]
-        levels: String,
+        /// Mask level elements (comma-separated). Each --add starts a new level.
+        #[arg(long = "add")]
+        add: Vec<String>,
     },
 }
 
@@ -183,6 +185,38 @@ fn parse_background_mode(s: &str) -> Result<BackgroundMode, String> {
     }
 }
 
+/// Convert --add groups into MaskSpec entries.
+/// Each --add value is a comma-separated list of element numbers.
+/// First group → Mask mode (specific elements), subsequent → Add mode (cumulative).
+/// If no groups provided, defaults to NoMask (all elements).
+fn add_groups_to_mask_specs(add: &[String]) -> Result<Vec<MaskSpec>> {
+    if add.is_empty() {
+        return Ok(vec![MaskSpec {
+            mode: MaskMode::NoMask,
+            elements: Vec::new(),
+        }]);
+    }
+
+    let mut specs = Vec::new();
+    for (i, group_str) in add.iter().enumerate() {
+        let elements: Vec<usize> = group_str
+            .split(',')
+            .map(|s| {
+                s.trim()
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid element '{}' in --add", s.trim()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mode = if i == 0 {
+            MaskMode::Mask
+        } else {
+            MaskMode::Add
+        };
+        specs.push(MaskSpec { mode, elements });
+    }
+    Ok(specs)
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
@@ -193,15 +227,21 @@ fn main() -> Result<()> {
             training_set,
             database,
             region: region_str,
-            levels,
-            cutoffs,
+            add,
+            cutoff,
+            logzero,
             processing: _processing,
             strand,
             output: output_style,
             background: _background,
             pseudo_count,
             format: output_format,
+            cpu,
         } => {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(cpu)
+                .build_global()
+                .context("configuring thread pool")?;
             // Parse inputs.
             let ts = epn::parse_epn(&training_set)
                 .with_context(|| format!("loading training set '{}'", training_set))?;
@@ -209,12 +249,12 @@ fn main() -> Result<()> {
             let reg = region::parse_region(&region_str)
                 .with_context(|| format!("parsing region '{}'", region_str))?;
 
-            let mask_specs = region::parse_mask_specs(&levels)
-                .with_context(|| format!("parsing mask levels '{}'", levels))?;
+            let mask_specs = add_groups_to_mask_specs(&add)
+                .context("parsing --add mask levels")?;
 
             // Build pattern with profiles.
             let bg = Background::default();
-            let pat = pattern::build_pattern(&ts, &reg, &bg, pseudo_count, -20.0);
+            let pat = pattern::build_pattern(&ts, &reg, &bg, pseudo_count, logzero);
 
             eprintln!(
                 "Training set: {:?}\n  {} sequences of length {}",
@@ -230,7 +270,10 @@ fn main() -> Result<()> {
             // Resolve masks and compute thresholds.
             let mut masks = search::resolve_masks(&mask_specs, &pat);
 
-            let cutoff_list: Vec<String> = cutoffs.split(',').map(|s| s.trim().to_string()).collect();
+            let cutoff_list: Vec<String> = match cutoff {
+                Some(vals) => vals,
+                None => vec!["100%".to_string()],
+            };
             search::compute_thresholds(&ts, &pat, &mut masks, &cutoff_list);
 
             for (i, mask) in masks.iter().enumerate() {
@@ -356,12 +399,13 @@ fn main() -> Result<()> {
         Commands::Stats {
             training_set,
             region: region_str,
-            levels,
+            add,
         } => {
             let ts = epn::parse_epn(&training_set)
                 .with_context(|| format!("loading training set '{}'", training_set))?;
             let reg = region::parse_region(&region_str)?;
-            let mask_specs = region::parse_mask_specs(&levels)?;
+            let mask_specs = add_groups_to_mask_specs(&add)
+                .context("parsing --add mask levels")?;
             let bg = Background::default();
             let pat = pattern::build_pattern(&ts, &reg, &bg, 0.0002, -20.0);
             let masks = search::resolve_masks(&mask_specs, &pat);
@@ -417,14 +461,15 @@ fn main() -> Result<()> {
         Commands::Eval {
             training_set,
             region: region_str,
-            levels,
+            add,
             megabases,
             both_strands,
         } => {
             let ts = epn::parse_epn(&training_set)
                 .with_context(|| format!("loading training set '{}'", training_set))?;
             let reg = region::parse_region(&region_str)?;
-            let mask_specs = region::parse_mask_specs(&levels)?;
+            let mask_specs = add_groups_to_mask_specs(&add)
+                .context("parsing --add mask levels")?;
             let bg = Background::default();
             let pat = pattern::build_pattern(&ts, &reg, &bg, 0.0002, -20.0);
             let mut masks = search::resolve_masks(&mask_specs, &pat);
@@ -472,12 +517,13 @@ fn main() -> Result<()> {
         Commands::Configs {
             training_set,
             region: region_str,
-            levels,
+            add,
         } => {
             let ts = epn::parse_epn(&training_set)
                 .with_context(|| format!("loading training set '{}'", training_set))?;
             let reg = region::parse_region(&region_str)?;
-            let mask_specs = region::parse_mask_specs(&levels)?;
+            let mask_specs = add_groups_to_mask_specs(&add)
+                .context("parsing --add mask levels")?;
             let bg = Background::default();
             let pat = pattern::build_pattern(&ts, &reg, &bg, 0.0002, -20.0);
             let masks = search::resolve_masks(&mask_specs, &pat);

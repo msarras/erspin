@@ -50,7 +50,7 @@ pub fn resolve_masks(specs: &[MaskSpec], pattern: &Pattern) -> Vec<ResolvedMask>
     let mut resolved = Vec::with_capacity(specs.len());
     let mut prev_elements: Vec<i32> = Vec::new();
 
-    for spec in specs {
+    for (level, spec) in specs.iter().enumerate() {
         let element_ids = resolve_element_ids(spec, pattern, &prev_elements);
         prev_elements = element_ids.clone();
 
@@ -70,7 +70,28 @@ pub fn resolve_masks(specs: &[MaskSpec], pattern: &Pattern) -> Vec<ResolvedMask>
             .map(|(i, _)| i)
             .collect();
 
-        let configs = generate_configs(pattern, &hx_indices, &st_indices);
+        // Precompute configs if the count is manageable. Otherwise, leave
+        // configs empty; the search will use DMP (per-hit constrained config
+        // generation) for that level.
+        let configs = if level == 0 {
+            generate_configs(pattern, &hx_indices, &st_indices)
+        } else {
+            let in_mask = build_atom_membership(pattern, &hx_indices, &st_indices);
+            let first = in_mask.iter().position(|&m| m).unwrap_or(0);
+            let last = in_mask.iter().rposition(|&m| m).unwrap_or(0);
+            let gap_vars =
+                collect_gap_variables(pattern, &st_indices, &in_mask, first, last);
+            let total: usize = gap_vars
+                .iter()
+                .map(|v| v.max_gaps + 1)
+                .product::<usize>()
+                .max(1);
+            if total <= 100_000 {
+                generate_configs(pattern, &hx_indices, &st_indices)
+            } else {
+                Vec::new() // DMP will handle this level
+            }
+        };
         let (min_bgn, max_bgn, min_len, max_len) =
             compute_mask_geometry(pattern, &hx_indices, &st_indices);
 
@@ -164,6 +185,7 @@ fn generate_configs(
             st_gaps: vec![0; nst],
             hx_bgn: vec![0; nhx],
             hx_gaps: vec![0; nhx],
+            atom_gaps: Vec::new(),
         }];
     }
 
@@ -176,6 +198,7 @@ fn generate_configs(
             st_gaps: vec![0; nst],
             hx_bgn: vec![0; nhx],
             hx_gaps: vec![0; nhx],
+            atom_gaps: vec![0; pattern.atoms.len()],
         }];
     };
     let last_mask = in_mask.iter().rposition(|&m| m).unwrap();
@@ -193,6 +216,85 @@ fn generate_configs(
 
         let atom_gaps =
             distribute_gaps(pattern, &gap_vars, &gap_values, pattern.atoms.len());
+
+        let config = build_config_from_gaps(
+            pattern,
+            hx_indices,
+            st_indices,
+            &in_mask,
+            &atom_gaps,
+            first_mask,
+            last_mask,
+        );
+        configs.push(config);
+    }
+
+    configs
+}
+
+/// Generate configs for a mask level, constraining gap variables that were
+/// within the previous mask's envelope to their winning values (DMP).
+///
+/// `prev_atom_gaps` contains the per-atom gap assignments from the winning
+/// config of the previous level. Gap variables whose atom range falls within
+/// `prev_first..=prev_last` are fixed; others are enumerated freely.
+fn generate_configs_constrained(
+    pattern: &Pattern,
+    hx_indices: &[usize],
+    st_indices: &[usize],
+    prev_atom_gaps: &[usize],
+    prev_first: usize,
+    prev_last: usize,
+) -> Vec<Config> {
+    let nhx = hx_indices.len();
+    let nst = st_indices.len();
+
+    let in_mask = build_atom_membership(pattern, hx_indices, st_indices);
+
+    let Some(first_mask) = in_mask.iter().position(|&m| m) else {
+        return vec![Config {
+            len: 0,
+            st_bgn: vec![0; nst],
+            st_gaps: vec![0; nst],
+            hx_bgn: vec![0; nhx],
+            hx_gaps: vec![0; nhx],
+            atom_gaps: vec![0; pattern.atoms.len()],
+        }];
+    };
+    let last_mask = in_mask.iter().rposition(|&m| m).unwrap();
+
+    let gap_vars = collect_gap_variables(pattern, st_indices, &in_mask, first_mask, last_mask);
+
+    // Split variables into fixed (within previous envelope) and free.
+    let mut free_indices = Vec::new();
+    let mut fixed_values = vec![0usize; gap_vars.len()];
+
+    for (vi, var) in gap_vars.iter().enumerate() {
+        if var.atom_range.0 >= prev_first && var.atom_range.1 <= prev_last + 1 {
+            // Variable falls within previous envelope: fix to the sum of
+            // previous atom gaps over its range.
+            let sum: usize = (var.atom_range.0..var.atom_range.1)
+                .map(|a| prev_atom_gaps[a])
+                .sum();
+            fixed_values[vi] = sum;
+        } else {
+            free_indices.push(vi);
+        }
+    }
+
+    let free_ranges: Vec<usize> = free_indices.iter().map(|&i| gap_vars[i].max_gaps + 1).collect();
+    let total: usize = free_ranges.iter().copied().product::<usize>().max(1);
+    let mut configs = Vec::with_capacity(total);
+
+    for combo_idx in 0..total {
+        let free_values = decode_combination(combo_idx, &free_ranges);
+
+        let mut gap_values = fixed_values.clone();
+        for (fi, &vi) in free_indices.iter().enumerate() {
+            gap_values[vi] = free_values[fi];
+        }
+
+        let atom_gaps = distribute_gaps(pattern, &gap_vars, &gap_values, pattern.atoms.len());
 
         let config = build_config_from_gaps(
             pattern,
@@ -359,6 +461,7 @@ fn build_config_from_gaps(
         st_gaps,
         hx_bgn,
         hx_gaps,
+        atom_gaps: atom_gaps.to_vec(),
     }
 }
 
@@ -404,9 +507,19 @@ fn compute_mask_geometry(
 // Cascade Search
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// Compute the atom envelope (first, last atom indices) for a mask.
+fn atom_envelope(pattern: &Pattern, mask: &ResolvedMask) -> (usize, usize) {
+    let in_mask = build_atom_membership(pattern, &mask.hx_indices, &mask.st_indices);
+    let first = in_mask.iter().position(|&m| m).unwrap_or(0);
+    let last = in_mask.iter().rposition(|&m| m).unwrap_or(0);
+    (first, last)
+}
+
 /// Search a single sequence with a multi-level mask cascade.
 ///
-/// Returns all non-overlapping hits that pass all threshold levels.
+/// Level 0 uses precomputed configs (SMP). Levels 1+ use dynamic mask
+/// processing (DMP): for each hit from the previous level, constrained
+/// configs are generated based on the winning config's gap assignments.
 pub fn search_sequence(
     pattern: &Pattern,
     masks: &[ResolvedMask],
@@ -417,18 +530,72 @@ pub fn search_sequence(
         return Vec::new();
     }
 
-    // Level 0: scan the entire sequence.
+    // Level 0: scan the entire sequence with precomputed configs.
     let mut current_hits = scan_level(pattern, &masks[0], seq_data, 0, seq_data.len());
 
-    // Subsequent levels: narrow search around each hit from the previous level.
-    for mask in &masks[1..] {
-        let mut next_hits = Vec::new();
-        for hit in &current_hits {
-            let search_bgn = hit.offset.saturating_sub(pattern.max_len);
-            let search_end = (hit.offset + pattern.max_len).min(seq_data.len());
-            next_hits.extend(scan_level(pattern, mask, seq_data, search_bgn, search_end));
+    // Subsequent levels: SMP if configs were precomputed, DMP otherwise.
+    for level in 1..masks.len() {
+        let next_mask = &masks[level];
+
+        if !next_mask.configs.is_empty() {
+            // SMP: precomputed configs — scan around each hit.
+            let mut next_hits = Vec::new();
+            for hit in &current_hits {
+                let search_bgn = hit.offset.saturating_sub(pattern.max_len);
+                let search_end = (hit.offset + pattern.max_len).min(seq_data.len());
+                next_hits.extend(scan_level(
+                    pattern, next_mask, seq_data, search_bgn, search_end,
+                ));
+            }
+            current_hits = next_hits;
+        } else {
+            // DMP: generate constrained configs per-hit and score directly.
+            let prev_mask = &masks[level - 1];
+            let (prev_first, prev_last) = atom_envelope(pattern, prev_mask);
+
+            // DMP hits are independent — process in parallel.
+            let next_hits: Vec<Hit> = current_hits
+                .par_iter()
+                .filter_map(|hit| {
+                    let constrained_configs = generate_configs_constrained(
+                        pattern,
+                        &next_mask.hx_indices,
+                        &next_mask.st_indices,
+                        &hit.atom_gaps,
+                        prev_first,
+                        prev_last,
+                    );
+
+                    if constrained_configs.is_empty() {
+                        return None;
+                    }
+
+                    let tmp_mask = ResolvedMask {
+                        hx_indices: next_mask.hx_indices.clone(),
+                        st_indices: next_mask.st_indices.clone(),
+                        configs: constrained_configs,
+                        threshold: next_mask.threshold,
+                        min_bgn: next_mask.min_bgn,
+                        max_bgn: next_mask.max_bgn,
+                        min_len: next_mask.min_len,
+                        max_len: next_mask.max_len,
+                    };
+
+                    let (score, cfg_idx) =
+                        scoring::score_configs_direct(seq_data, pattern, &tmp_mask, hit.offset);
+                    (score > tmp_mask.threshold).then(|| Hit {
+                        offset: hit.offset,
+                        length: tmp_mask.configs[cfg_idx].len,
+                        score,
+                        evalue: None,
+                        direction: StrandDirection::Forward,
+                        config_index: cfg_idx,
+                        atom_gaps: tmp_mask.configs[cfg_idx].atom_gaps.clone(),
+                    })
+                })
+                .collect();
+            current_hits = next_hits;
         }
-        current_hits = next_hits;
     }
 
     overlap_filter(&current_hits, direction)
@@ -465,10 +632,12 @@ fn scan_level(
                 evalue: None,
                 direction: StrandDirection::Forward,
                 config_index: cfg_idx,
+                atom_gaps: mask.configs[cfg_idx].atom_gaps.clone(),
             })
         })
         .collect()
 }
+
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Hit Processing
