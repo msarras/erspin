@@ -286,7 +286,7 @@ mod tests {
 
     #[test]
     fn test_evalue_computation() {
-        let ts = epn::parse_epn("erpin5.5.4.serv/start.test/trna.typeI.epn").unwrap();
+        let ts = epn::parse_epn("tests/data/trna.typeI.epn").unwrap();
         let reg = Region { begin: -2, end: 2 };
         let bg = Background::default();
         let pat = pattern::build_pattern(&ts, &reg, &bg, 0.0002, -20.0);

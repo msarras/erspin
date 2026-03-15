@@ -195,7 +195,7 @@ GGCC
     #[test]
     fn read_test_fasta_file() {
         let reader =
-            FastaReader::from_path("erpin5.5.4.serv/start.test/test.trna.fasta").unwrap();
+            FastaReader::from_path("tests/data/test.trna.fasta").unwrap();
         let seqs = reader.collect_all().unwrap();
         assert_eq!(seqs.len(), 1);
         // The FASTA file has ~2000 nucleotide characters across multiple lines.

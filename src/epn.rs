@@ -240,7 +240,7 @@ mod tests {
 
     #[test]
     fn parse_trna_epn() {
-        let ts = parse_epn("erpin5.5.4.serv/start.test/trna.typeI.epn").unwrap();
+        let ts = parse_epn("tests/data/trna.typeI.epn").unwrap();
         assert_eq!(ts.alignment_len, 80);
         assert!(ts.nseq > 100);
         // tRNA type I should have 4 helices and several strands

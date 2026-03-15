@@ -14,12 +14,8 @@ Given a training set alignment (`.epn` file) describing an RNA secondary structu
 
 **Mask specification** syntax:
 - Element indices (e.g., `6,8`) — use these elements at this level
-- `!` prefix (umask) — use all elements *except* these
-- `+` prefix — add elements to the previous level's mask
-- `*` (nomask) — use all elements
-- `/` separates levels
-
-Example: `!6,8 / +2,3 / *` defines three levels — first uses everything except elements 6 and 8, second adds elements 2 and 3, third uses all elements.
+- Multiple `--add` flags define levels: first is the initial mask, subsequent add elements cumulatively
+- Omit `--add` entirely to use all elements (nomask)
 
 ## Installation
 
@@ -43,35 +39,41 @@ cargo install --path .
 Search for RNA motifs in a FASTA database:
 
 ```bash
-erspin search \
-  -t training.epn \
-  -d database.fasta \
-  -r "-2,2" \
-  -l "!6,8 / +2,3 / *" \
-  -c "100%,100%,90%"
+erspin search training.epn database.fasta "-2,2" \
+  --add 2,4,5,6 --add 3,8,9,10 \
+  --cutoff 100% 100% 90%
 ```
+
+Positional arguments:
+
+| Argument | Description |
+|----------|-------------|
+| `training_set` | Training set file (`.epn` format) |
+| `database` | Database file (FASTA format) |
+| `region` | Region specification (e.g., `-2,2` or `1,23`) |
+
+Options:
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-t` | Training set file (`.epn` format) | required |
-| `-d` | Database file (FASTA format) | required |
-| `-r` | Region specification (e.g., `-2,2`) | required |
-| `-l` | Mask levels, `/`-separated | required |
-| `-c` | Cutoff thresholds per level, comma-separated (percentage or raw score) | `100%` |
+| `--add` | Mask level elements (comma-separated, repeatable). First `--add` is the initial mask, subsequent groups add elements cumulatively. Omit for all elements. | all elements |
+| `--cutoff` | Cutoff thresholds per level (space-separated, raw scores or percentages like `100%`) | `100%` |
+| `--logzero` | Minimum log-odds value for zero-count positions | `-20.0` |
 | `--processing` | `dynamic` or `static` mask processing | `dynamic` |
 | `--strand` | `forward`, `reverse`, or `both` | `both` |
 | `--output` | `full`, `compact`, or `quiet` | `full` |
 | `--background` | `global`, `local`, or `uniform` | `global` |
 | `--pseudo-count` | Pseudo-count weight (0.0–1.0) | `0.0002` |
 | `--format` | `text`, `json`, or `tsv` | `text` |
+| `--cpu` | Number of threads for parallel search | `4` |
 
 ### view
 
 Inspect a training set's structure and alignment:
 
 ```bash
-erspin view -t training.epn
-erspin view -t training.epn -r "-2,2"
+erspin view training.epn
+erspin view training.epn "-2,2"
 ```
 
 ### stats
@@ -79,7 +81,7 @@ erspin view -t training.epn -r "-2,2"
 Show score statistics (min/median/mean/max) for training sequences at each mask level:
 
 ```bash
-erspin stats -t training.epn -r "-2,2" -l "6,8 / *"
+erspin stats training.epn "-2,2" --add 6,8
 ```
 
 ### eval
@@ -87,7 +89,7 @@ erspin stats -t training.epn -r "-2,2" -l "6,8 / *"
 Estimate E-values for given cutoffs and database size:
 
 ```bash
-erspin eval -t training.epn -r "-2,2" -l "6,8 / *" -m 1.0
+erspin eval training.epn "-2,2" --add 6,8 -m 1.0
 ```
 
 ### configs
@@ -95,7 +97,7 @@ erspin eval -t training.epn -r "-2,2" -l "6,8 / *" -m 1.0
 Show configuration counts per mask level:
 
 ```bash
-erspin configs -t training.epn -r "-2,2" -l "6,8 / *"
+erspin configs training.epn "-2,2" --add 6,8
 ```
 
 ## Quick start with test data
@@ -106,19 +108,19 @@ The repository includes tRNA test data from the original ERPIN distribution:
 cargo build --release
 
 ./target/release/erspin search \
-  -t erpin5.5.4.serv/start.test/trna.typeI.epn \
-  -d erpin5.5.4.serv/start.test/test.trna.fasta \
-  -r "-2,2" \
-  -l "!6,8 / +2,3 / *" \
-  -c "100%,100%,90%"
+  tests/data/trna.typeI.epn \
+  tests/data/test.trna.fasta \
+  "-2,2" \
+  --add 1,2,3,4,5,7,9,10 --add 6,8 \
+  --cutoff 100% 100% 90%
 ```
 
-Expected reference output from the original C ERPIN is in `erpin5.5.4.serv/start.test/test.txt`.
+Expected reference output is in `tests/data/test.txt`.
 
 ## Testing
 
 ```bash
-cargo test           # run all 25 tests
+cargo test           # run all 26 tests
 cargo test <name>    # run a single test by name
 ```
 
@@ -137,7 +139,7 @@ Three benchmark groups:
 
 - **component** — helix/strand/config scoring throughput
 - **search** — full search at various sequence sizes (2KB–1MB) and parallelism levels
-- **cli** — end-to-end comparison of Rust erspin vs. the original C ERPIN binary
+- **cli** — end-to-end CLI throughput
 
 ## Project structure
 
@@ -159,5 +161,6 @@ src/
   error.rs      Error types
 benches/
   search_bench.rs   Criterion benchmarks
-erpin5.5.4.serv/    Original C ERPIN v5.5.4 (reference implementation)
+tests/
+  data/             Test data (tRNA training set, FASTA sequences)
 ```

@@ -829,7 +829,7 @@ mod tests {
     use crate::region;
 
     fn setup_trna() -> (Pattern, Vec<ResolvedMask>) {
-        let ts = epn::parse_epn("erpin5.5.4.serv/start.test/trna.typeI.epn").unwrap();
+        let ts = epn::parse_epn("tests/data/trna.typeI.epn").unwrap();
         let reg = Region { begin: -2, end: 2 };
         let bg = Background::default();
         let pat = pattern::build_pattern(&ts, &reg, &bg, 0.0002, -20.0);
@@ -863,7 +863,7 @@ mod tests {
 
     #[test]
     fn test_resolve_masks() {
-        let ts = epn::parse_epn("erpin5.5.4.serv/start.test/trna.typeI.epn").unwrap();
+        let ts = epn::parse_epn("tests/data/trna.typeI.epn").unwrap();
         let reg = Region { begin: -2, end: 2 };
         let bg = Background::default();
         let pat = pattern::build_pattern(&ts, &reg, &bg, 0.0002, -20.0);
@@ -896,7 +896,7 @@ mod tests {
         let (pat, masks) = setup_trna();
 
         let reader =
-            crate::fasta::FastaReader::from_path("erpin5.5.4.serv/start.test/test.trna.fasta")
+            crate::fasta::FastaReader::from_path("tests/data/test.trna.fasta")
                 .unwrap();
         let sequences = reader.collect_all().unwrap();
         let seq = &sequences[0];
@@ -919,7 +919,7 @@ mod tests {
         let (pat, masks) = setup_trna();
 
         let reader =
-            crate::fasta::FastaReader::from_path("erpin5.5.4.serv/start.test/test.trna.fasta")
+            crate::fasta::FastaReader::from_path("tests/data/test.trna.fasta")
                 .unwrap();
         let sequences = reader.collect_all().unwrap();
         let base_data = &sequences[0].data;

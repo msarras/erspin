@@ -381,7 +381,7 @@ mod tests {
     use crate::types::Region;
 
     fn load_test_pattern() -> (TrainingSet, Pattern) {
-        let ts = epn::parse_epn("erpin5.5.4.serv/start.test/trna.typeI.epn").unwrap();
+        let ts = epn::parse_epn("tests/data/trna.typeI.epn").unwrap();
         let region = Region { begin: -2, end: 2 };
         let bg = Background::default();
         let pat = pattern::build_pattern(&ts, &region, &bg, 0.0002, -20.0);

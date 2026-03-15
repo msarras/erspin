@@ -52,7 +52,7 @@ struct TestFixture {
 impl TestFixture {
     fn load() -> Self {
         let ts =
-            epn::parse_epn("erpin5.5.4.serv/start.test/trna.typeI.epn").unwrap();
+            epn::parse_epn("tests/data/trna.typeI.epn").unwrap();
         let reg = Region { begin: -2, end: 2 };
         let bg = Background::default();
         let pat = pattern::build_pattern(&ts, &reg, &bg, 0.0002, -20.0);
@@ -257,21 +257,19 @@ fn bench_search_parallel(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// C ERPIN comparison benchmark (end-to-end CLI)
+// CLI benchmark (end-to-end)
 // ---------------------------------------------------------------------------
 
-fn bench_c_vs_rust_cli(c: &mut Criterion) {
-    // Generate test FASTA files at different sizes.
+fn bench_cli(c: &mut Criterion) {
     let sizes: &[(usize, usize, &str)] = &[
         (1, 10_000, "10kb"),
         (1, 100_000, "100kb"),
         (1, 1_000_000, "1Mb"),
     ];
 
-    let c_binary = "erpin5.5.4.serv/bin/erpin";
-    let epn = "erpin5.5.4.serv/start.test/trna.typeI.epn";
+    let epn = "tests/data/trna.typeI.epn";
 
-    // Build release binary for Rust.
+    // Build release binary.
     let build_status = Command::new("cargo")
         .args(["build", "--release"])
         .status()
@@ -280,7 +278,7 @@ fn bench_c_vs_rust_cli(c: &mut Criterion) {
 
     let rust_binary = "target/release/erspin";
 
-    let mut group = c.benchmark_group("cli_comparison");
+    let mut group = c.benchmark_group("cli");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(15));
 
@@ -291,29 +289,7 @@ fn bench_c_vs_rust_cli(c: &mut Criterion) {
         let total_bytes = (nseq * seq_len) as u64;
         group.throughput(Throughput::Bytes(total_bytes));
 
-        // Benchmark C ERPIN.
-        if std::path::Path::new(c_binary).exists() {
-            group.bench_with_input(BenchmarkId::new("c_erpin", label), &fasta_path, |b, fasta| {
-                b.iter(|| {
-                    let output = Command::new(c_binary)
-                        .args([
-                            epn,
-                            fasta,
-                            "-2,2",
-                            "-umask", "6", "8",
-                            "-mask", "2", "3",
-                            "-nomask",
-                            "-cutoff", "100%", "100%", "90%",
-                        ])
-                        .output()
-                        .expect("failed to run C ERPIN");
-                    black_box(output);
-                });
-            });
-        }
-
-        // Benchmark Rust erspin.
-        group.bench_with_input(BenchmarkId::new("rust_erspin", label), &fasta_path, |b, fasta| {
+        group.bench_with_input(BenchmarkId::new("erspin", label), &fasta_path, |b, fasta| {
             b.iter(|| {
                 let output = Command::new(rust_binary)
                     .args([
@@ -326,7 +302,7 @@ fn bench_c_vs_rust_cli(c: &mut Criterion) {
                         "--output", "quiet",
                     ])
                     .output()
-                    .expect("failed to run Rust erspin");
+                    .expect("failed to run erspin");
                 black_box(output);
             });
         });
@@ -354,7 +330,7 @@ criterion_group!(
 
 criterion_group!(
     cli_benches,
-    bench_c_vs_rust_cli,
+    bench_cli,
 );
 
 criterion_main!(component_benches, search_benches, cli_benches);

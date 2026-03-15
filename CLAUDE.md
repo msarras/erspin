@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**erspin** is a Rust rewrite of ERPIN (Easy RNA Profile Identification), a bioinformatics tool that searches for RNA motifs in nucleotide sequence databases. The original ERPIN C implementation (v5.5.4) is included in `erpin5.5.4.serv/` as reference.
+**erspin** is a Rust rewrite of ERPIN (Easy RNA Profile Identification), a bioinformatics tool that searches for RNA motifs in nucleotide sequence databases.
 
 ERPIN works by taking a training set alignment (`.epn` file) and scanning FASTA sequence databases for matching RNA structural motifs using multi-level mask processing with configurable score thresholds/cutoffs.
 
@@ -41,7 +41,7 @@ Single binary with subcommands (`search`, `view`, `stats`, `eval`, `configs`), u
 - `src/output.rs` — structured output formatting: text (default), JSON, TSV; output styles: full, compact, quiet
 - `src/evalue.rs` — E-value computation via convolution-based histogram method: per-column score distributions → element histograms → mask histogram → CDF → extreme value correction
 - `src/error.rs` — error types with `thiserror`
-- `benches/search_bench.rs` — criterion benchmarks: component (helix/strand/config scoring), full search at various sizes, C vs Rust CLI comparison
+- `benches/search_bench.rs` — criterion benchmarks: component (helix/strand/config scoring), full search at various sizes, CLI throughput
 
 ### Key Design Decisions
 
@@ -49,7 +49,7 @@ Single binary with subcommands (`search`, `view`, `stats`, `eval`, `configs`), u
 - FASTA reader is streaming to support multi-GB databases
 - Mask spec syntax redesigned: `!` for umask, `+` for add, `*` for nomask, `/` separates levels
 - Region args use `allow_hyphen_values` since specs like `-2,2` start with hyphen
-- Config generation: only strand atoms are gap variables; helix gaps are derived from intervening atom positions (matches C ERPIN approach in mcfgs.c)
+- Config generation: only strand atoms are gap variables; helix gaps are derived from intervening atom positions
 - Multi-level search window uses `pattern.max_len` extent (not mask-specific), since different masks start at different atoms
 - Gapped strand DP uses pre-allocated flat buffer with banded reset (only touches band entries, not full table)
 - `ConfigLookup` caches slice references and uses suffix-max bounds for early termination in the config scoring inner loop
@@ -62,21 +62,7 @@ Single binary with subcommands (`search`, `view`, `stats`, `eval`, `configs`), u
 - Full search throughput: ~3.3 MiB/s at 1MB sequences
 - Rust vs C ERPIN: ~18x faster at 10KB, ~4x at 100KB, ~1.7x at 1MB
 
-## Reference C Implementation
-
-Located in `erpin5.5.4.serv/`. Key files:
-
-- `apps/erpin.c` — main search tool (the primary port target)
-- `libsrc/msearch.c` — static mask search (MaskSearch)
-- `libsrc/dmp.c` — dynamic mask search (RecMaskSearch)
-- `libsrc/scores.c` — scoring hot loops (GetHlxScoresTab, GetStScoresTab)
-- `libsrc/align.c` — Needleman-Wunsch DP for gapped strands
-- `libsrc/trset.c` — training set parser
-- `libsrc/mcfgs.c` — config generation (gap variable enumeration)
-- `include/rnaIV.h` — all struct definitions and constants
-- `start.test/` — tRNA test data with expected output in `test.txt`
-
-### Key ERPIN Concepts
+## Key ERPIN Concepts
 
 - **Training set (.epn)**: Two model digit lines encode secondary structure (read column-by-column, concatenated vertically to form element codes). Codes appearing twice → helix (5'/3' strands); once → isolated strand.
 - **Masks**: Subsets of structural elements used at each search level.

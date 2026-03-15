@@ -290,7 +290,7 @@ mod tests {
 
     #[test]
     fn test_build_trna_pattern() {
-        let ts = epn::parse_epn("erpin5.5.4.serv/start.test/trna.typeI.epn").unwrap();
+        let ts = epn::parse_epn("tests/data/trna.typeI.epn").unwrap();
         let region = Region {
             begin: -2,
             end: 2,

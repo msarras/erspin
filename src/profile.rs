@@ -338,7 +338,7 @@ mod tests {
 
     #[test]
     fn test_build_profiles_on_real_data() {
-        let ts = crate::epn::parse_epn("erpin5.5.4.serv/start.test/trna.typeI.epn").unwrap();
+        let ts = crate::epn::parse_epn("tests/data/trna.typeI.epn").unwrap();
         let bg = Background::default();
         let (strand_profiles, helix_profiles) = build_all_profiles(&ts, &bg, 0.0002, LOG_ZERO);
 
