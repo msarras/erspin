@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the following article."
+title: "erspin"
+type: software
+references:
+  - type: article
+    authors:
+      - family-names: Gautheret
+        given-names: Daniel
+      - family-names: Lambert
+        given-names: Aymeric
+    title: "Direct RNA Motif Definition and Identification from Multiple Sequence Alignments using Secondary Structure Profiles"
+    journal: "Journal of Molecular Biology"
+    volume: 313
+    start: 1003
+    end: 1011
+    year: 2001
+    doi: "10.1006/jmbi.2001.5102"

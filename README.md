@@ -141,6 +141,12 @@ Three benchmark groups:
 - **search** — full search at various sequence sizes (2KB–1MB) and parallelism levels
 - **cli** — end-to-end CLI throughput
 
+## Citation
+
+If you find erspin useful, please cite the original ERPIN paper:
+
+> Gautheret D, Lambert A. (2001) Direct RNA Motif Definition and Identification from Multiple Sequence Alignments using Secondary Structure Profiles. *J Mol Biol.* 313:1003-11. doi:[10.1006/jmbi.2001.5102](https://doi.org/10.1006/jmbi.2001.5102)
+
 ## Project structure
 
 ```
