@@ -6,8 +6,59 @@
 //! Strategy: process multiple scan positions simultaneously by reordering loops
 //! from position-major (for s { for j }) to column-major (for j { for s }).
 
-use crate::profile::{self, nt_strand_code, DINUC_LUT, LOG_ZERO};
+use std::cell::RefCell;
+
+use crate::profile::{self, nt_strand_code, LOG_ZERO};
 use crate::types::*;
+
+thread_local! {
+    /// Per-thread interleaved DP buffer for `compute_strand_score_table_gapped_into`.
+    /// Reused across calls so the gapped-strand DP doesn't allocate per
+    /// (scan-window × strand) — for the trna fixture this is dozens to hundreds
+    /// of allocations per chunk.
+    static SCRATCH_DP_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    /// Per-thread per-lane scores buffer (W * num_gaps f32).
+    static SCRATCH_SCORES: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    /// Per-thread scalar DP fallback buffers (f64 align + f64 scores).
+    static SCRATCH_ALIGN_F64: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
+    static SCRATCH_GAP_PROF_F64: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
+    static SCRATCH_FLAT_PROF_F64: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
+    static SCRATCH_SCORES_F64: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
+    /// Per-thread helix-class encoded sequence (size scan_len + max_len - 1).
+    static SCRATCH_HELIX_CODES: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    /// Per-thread strand nibble-encoded sequence (size scan_len + max_len - 1).
+    /// Pre-encoding once amortizes the LUT lookup across all (lane, i, j) DP
+    /// inner-loop entries — `multi_dp_w` previously called `nt_strand_code` per
+    /// (lane, i) which compounds across deep DP fills.
+    static SCRATCH_STRAND_CODES: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Set `buf` to length `len` with possibly-stale contents past its current
+/// initialized region; callers must overwrite every position in `0..len`
+/// before reading. `Vec::reserve(N)` ensures capacity ≥ `len() + N` (NOT
+/// `capacity() + N`), so we compute `additional` relative to `buf.len()`.
+#[inline]
+fn scratch_uninit<T: Copy>(buf: &mut Vec<T>, len: usize) {
+    if buf.capacity() < len {
+        buf.reserve(len - buf.len());
+    }
+    // SAFETY: capacity ≥ len after the reserve above. Bytes beyond the previous
+    // initialized region are stale; callers MUST overwrite every position
+    // before reading.
+    unsafe {
+        buf.set_len(len);
+    }
+}
+
+#[inline]
+fn scratch_uninit_u8(buf: &mut Vec<u8>, len: usize) {
+    if buf.capacity() < len {
+        buf.reserve(len - buf.len());
+    }
+    unsafe {
+        buf.set_len(len);
+    }
+}
 
 /// Resize `table` to have exactly `outer_len` inner buffers, each with
 /// `inner_len` accessible elements. Inner contents are uninitialized;
@@ -64,16 +115,11 @@ pub fn compute_strand_score_table_nogap_into(seq: &[u8], strand: &Strand, scores
         return;
     };
 
-    // Precomputed per-column lookup lives on the Strand: layout is
-    // `profile_f32[code * max_len + j]` (6 codes × max_len). Stage it into
-    // [code; 8] arrays per column so the inner loop can index by code with
-    // a power-of-two stride that the compiler vectorizes cleanly.
-    let mut col_vals = vec![[0.0f32; 8]; max_len];
-    for j in 0..max_len {
-        for code in 0..6 {
-            col_vals[j][code] = strand.profile_f32[code * max_len + j];
-        }
-    }
+    // Use the cached column-major profile (`profile_f32_t[j * 8 + code]`).
+    // Building a per-call `col_vals` was redundant — the stage is identical
+    // for every call against this Strand, so it now lives on the Strand and
+    // gets reused across thousands of scan windows.
+    let prof_t: &[f32] = &strand.profile_f32_t;
 
     scores.clear();
     scores.reserve(scan_len);
@@ -91,38 +137,53 @@ pub fn compute_strand_score_table_nogap_into(seq: &[u8], strand: &Strand, scores
     let remainder = scan_len % 8;
 
     // j == 0: assignment.
+    // SAFETY for both passes: prof_t.len() = max_len * 8, vals slice is 8 f32.
+    // NT_NIBBLE_LUT returns a value in 0..=5, so `vals[code]` with vals.len() == 8
+    // is in-bounds. seq_slice.len() == scan_len, scores.len() == scan_len.
     {
-        let vals = &col_vals[0];
+        let vals: &[f32] = &prof_t[0..8];
         let seq_slice = &seq[0..scan_len];
         for chunk in 0..chunks {
             let base = chunk * 8;
             for k in 0..8 {
-                let code = NT_NIBBLE_LUT[(seq_slice[base + k] & 0x0F) as usize];
-                scores[base + k] = vals[code as usize];
+                unsafe {
+                    let code = NT_NIBBLE_LUT[(seq_slice.get_unchecked(base + k) & 0x0F) as usize];
+                    *scores.get_unchecked_mut(base + k) =
+                        *vals.get_unchecked(code as usize);
+                }
             }
         }
         let base = chunks * 8;
         for k in 0..remainder {
-            let code = NT_NIBBLE_LUT[(seq_slice[base + k] & 0x0F) as usize];
-            scores[base + k] = vals[code as usize];
+            unsafe {
+                let code = NT_NIBBLE_LUT[(seq_slice.get_unchecked(base + k) & 0x0F) as usize];
+                *scores.get_unchecked_mut(base + k) =
+                    *vals.get_unchecked(code as usize);
+            }
         }
     }
 
     // j == 1..max_len: accumulation.
     for j in 1..max_len {
-        let vals = &col_vals[j];
+        let vals: &[f32] = &prof_t[j * 8..j * 8 + 8];
         let seq_slice = &seq[j..j + scan_len];
         for chunk in 0..chunks {
             let base = chunk * 8;
             for k in 0..8 {
-                let code = NT_NIBBLE_LUT[(seq_slice[base + k] & 0x0F) as usize];
-                scores[base + k] += vals[code as usize];
+                unsafe {
+                    let code = NT_NIBBLE_LUT[(seq_slice.get_unchecked(base + k) & 0x0F) as usize];
+                    *scores.get_unchecked_mut(base + k) +=
+                        *vals.get_unchecked(code as usize);
+                }
             }
         }
         let base = chunks * 8;
         for k in 0..remainder {
-            let code = NT_NIBBLE_LUT[(seq_slice[base + k] & 0x0F) as usize];
-            scores[base + k] += vals[code as usize];
+            unsafe {
+                let code = NT_NIBBLE_LUT[(seq_slice.get_unchecked(base + k) & 0x0F) as usize];
+                *scores.get_unchecked_mut(base + k) +=
+                    *vals.get_unchecked(code as usize);
+            }
         }
     }
 }
@@ -155,96 +216,100 @@ pub fn compute_helix_score_table_into(
 
     let hlen = helix.helix_len;
 
-    // Stage the helix profile into [code; 32] per-column arrays (32 to keep
-    // the stride a power of two for SIMD-friendly indexing). The first
-    // DINUC_CODES = 26 entries hold the actual rows; the rest are padding
-    // and are never read by the inner loop.
-    let n_codes = profile::DINUC_CODES;
-    let stride = 32usize;
-    let mut col_vals = vec![[0.0f32; 32]; hlen];
-    for j in 0..hlen {
-        for code in 0..n_codes {
-            col_vals[j][code] = helix.profile_f32[code * hlen + j];
-        }
-    }
-    let _ = stride;
+    // Use the cached per-column dinucleotide pair table. `pair[j*64 + (c5*8 +
+    // c3)]` directly gives the profile score for the (c5, c3) helix class
+    // pair at column j — folds the previous two-step lookup (c5, c3) →
+    // DINUC_LUT → profile_f32_t into a single 64-byte cache-line read.
+    let pair: &[f32] = &helix.pair_table;
 
     // Pre-encode the entire scan window into helix-class codes (0..6, see
     // `NT_HELIX_CLASS_LUT` in profile.rs). Without this, the inner loop calls
     // nt_helix_code() per (s, j, k), which re-runs the LUT for every base —
-    // millions of redundant lookups for anything but tiny patterns.
-    //
-    // Window size: we only ever read seq[0 .. scan_len + helix.max_len - 1].
+    // millions of redundant lookups for anything but tiny patterns. Use
+    // per-thread scratch so chunked search reuses the same buffer instead of
+    // allocating it per call.
     let needed = scan_len + helix.max_len - 1;
-    let mut codes = vec![6u8; needed];
-    for (i, c) in codes.iter_mut().enumerate() {
-        *c = profile::NT_HELIX_CLASS_LUT[seq[i] as usize];
-    }
 
-    // Flatten DINUC_LUT into a stride-7 byte array (7 helix classes) so the
-    // inner loop indexes it as a single contiguous array.
-    let mut dinuc_flat = [0u8; 49];
-    for c5 in 0..7 {
-        for c3 in 0..7 {
-            dinuc_flat[c5 * 7 + c3] = DINUC_LUT[c5][c3];
+    SCRATCH_HELIX_CODES.with(|cell| {
+        let mut codes_buf = cell.borrow_mut();
+        scratch_uninit_u8(&mut codes_buf, needed);
+        let codes = codes_buf.as_mut_slice();
+        for (i, c) in codes.iter_mut().enumerate() {
+            *c = profile::NT_HELIX_CLASS_LUT[seq[i] as usize];
         }
-    }
 
-    let chunks = scan_len / 8;
-    let remainder = scan_len % 8;
+        let chunks = scan_len / 8;
+        let remainder = scan_len % 8;
 
-    for k in 0..num_gaps {
-        let scores = &mut table[k];
+        for k in 0..num_gaps {
+            let scores = &mut table[k];
 
-        // j == 0: assignment pass (no zero-init pass needed).
-        {
-            let j = 0;
-            let vals = &col_vals[j];
-            let right_offset = helix.min_len - 1 + k - j;
-            for chunk in 0..chunks {
-                let base = chunk * 8;
-                for i in 0..8 {
+            // j == 0: assignment pass (no zero-init pass needed).
+            {
+                let j = 0;
+                // SAFETY: pair has length helix_len * 64, j < helix_len so
+                // j*64 + 64 ≤ pair.len(). Slice of exactly 64 elements.
+                let pair_col: &[f32] = &pair[j * 64..j * 64 + 64];
+                let right_offset = helix.min_len - 1 + k - j;
+                for chunk in 0..chunks {
+                    let base = chunk * 8;
+                    for i in 0..8 {
+                        let s = base + i;
+                        // SAFETY: codes has length scan_len + max_len - 1 ≥
+                        // s + j and s + right_offset, with j ≤ helix_len-1
+                        // and right_offset ≤ helix.max_len - 1, so both
+                        // indices < codes.len(). c5,c3 ∈ [0..6] (per
+                        // NT_HELIX_CLASS_LUT), so (c5 << 3) | c3 < 56 < 64
+                        // = pair_col.len().
+                        unsafe {
+                            let c5 = *codes.get_unchecked(s + j) as usize;
+                            let c3 = *codes.get_unchecked(s + right_offset) as usize;
+                            *scores.get_unchecked_mut(s) =
+                                *pair_col.get_unchecked((c5 << 3) | c3);
+                        }
+                    }
+                }
+                let base = chunks * 8;
+                for i in 0..remainder {
                     let s = base + i;
-                    let c5 = codes[s + j] as usize;
-                    let c3 = codes[s + right_offset] as usize;
-                    let code = dinuc_flat[c5 * 7 + c3] as usize;
-                    scores[s] = vals[code];
+                    unsafe {
+                        let c5 = *codes.get_unchecked(s + j) as usize;
+                        let c3 = *codes.get_unchecked(s + right_offset) as usize;
+                        *scores.get_unchecked_mut(s) =
+                            *pair_col.get_unchecked((c5 << 3) | c3);
+                    }
                 }
             }
-            let base = chunks * 8;
-            for i in 0..remainder {
-                let s = base + i;
-                let c5 = codes[s + j] as usize;
-                let c3 = codes[s + right_offset] as usize;
-                let code = dinuc_flat[c5 * 7 + c3] as usize;
-                scores[s] = vals[code];
-            }
-        }
 
-        // j == 1..hlen: accumulation pass.
-        for j in 1..hlen {
-            let vals = &col_vals[j];
-            let right_offset = helix.min_len - 1 + k - j;
-            for chunk in 0..chunks {
-                let base = chunk * 8;
-                for i in 0..8 {
+            // j == 1..hlen: accumulation pass.
+            for j in 1..hlen {
+                let pair_col: &[f32] = &pair[j * 64..j * 64 + 64];
+                let right_offset = helix.min_len - 1 + k - j;
+                for chunk in 0..chunks {
+                    let base = chunk * 8;
+                    for i in 0..8 {
+                        let s = base + i;
+                        unsafe {
+                            let c5 = *codes.get_unchecked(s + j) as usize;
+                            let c3 = *codes.get_unchecked(s + right_offset) as usize;
+                            *scores.get_unchecked_mut(s) +=
+                                *pair_col.get_unchecked((c5 << 3) | c3);
+                        }
+                    }
+                }
+                let base = chunks * 8;
+                for i in 0..remainder {
                     let s = base + i;
-                    let c5 = codes[s + j] as usize;
-                    let c3 = codes[s + right_offset] as usize;
-                    let code = dinuc_flat[c5 * 7 + c3] as usize;
-                    scores[s] += vals[code];
+                    unsafe {
+                        let c5 = *codes.get_unchecked(s + j) as usize;
+                        let c3 = *codes.get_unchecked(s + right_offset) as usize;
+                        *scores.get_unchecked_mut(s) +=
+                            *pair_col.get_unchecked((c5 << 3) | c3);
+                    }
                 }
             }
-            let base = chunks * 8;
-            for i in 0..remainder {
-                let s = base + i;
-                let c5 = codes[s + j] as usize;
-                let c3 = codes[s + right_offset] as usize;
-                let code = dinuc_flat[c5 * 7 + c3] as usize;
-                scores[s] += vals[code];
-            }
         }
-    }
+    });
 }
 
 /// Compute score table for a gapped strand using multi-position DP.
@@ -281,61 +346,108 @@ pub fn compute_strand_score_table_gapped_into(
     let seq_len = max_len;
     let dp_cols = prof_len + 1;
 
-    // Reuse the precomputed flat f32 profile that lives on the Strand.
-    // Layout: `profile_f32[code * max_len + j]`, length 6 * max_len.
+    // Use the column-major transposed profile (stride 8 = next power of two ≥
+    // NT_CODES). Per-lane gather inside the DP inner loop now hits a single
+    // 32-byte cache line instead of 4 lookups stridden by `prof_len * 4` bytes.
+    let prof_t: &[f32] = &strand.profile_f32_t;
     let flat_profile: &[f32] = &strand.profile_f32;
     let gap_profile = &flat_profile[4 * prof_len..5 * prof_len];
 
-    // Process W positions at a time.
+    // Process W positions at a time. W=4 matches AVX1's xmm register width
+    // for f32 ops; W=8 (ymm) was tried but didn't help measurably (compiler
+    // already widened the inner lane loop using fma-style packing) and
+    // doubled the dp_buf footprint.
     const W: usize = 4;
 
     let full_chunks = scan_len / W;
     let remainder = scan_len % W;
 
-    // Pre-allocate interleaved DP buffer.
-    // Layout: dp_buf[(i * dp_cols + j) * W + lane]
-    let dp_size = (seq_len + 1) * dp_cols;
-    let mut dp_buf = vec![f32::NEG_INFINITY; W * dp_size];
-    let mut scores_buf = vec![0.0f32; W * num_gaps];
+    // Pre-encode the strand's nibble codes for the entire scan window once,
+    // so multi_dp_w doesn't redo `seq[..] -> nt_strand_code` per (lane, i).
+    let codes_needed = scan_len + max_len - 1;
 
-    for chunk in 0..full_chunks {
-        let base_s = chunk * W;
+    SCRATCH_DP_BUF.with(|dp_cell| {
+    SCRATCH_SCORES.with(|sc_cell| {
+    SCRATCH_STRAND_CODES.with(|codes_cell| {
+        let mut dp_buf = dp_cell.borrow_mut();
+        let mut scores_buf = sc_cell.borrow_mut();
+        let mut codes = codes_cell.borrow_mut();
 
-        // Reset and fill W DP tables in parallel.
-        multi_dp_w::<W>(
-            seq, base_s, seq_len, prof_len, max_gaps, min_len,
-            &flat_profile, gap_profile, dp_cols, dp_size,
-            &mut dp_buf, &mut scores_buf,
-        );
+        let dp_size = (seq_len + 1) * dp_cols;
+        scratch_uninit(&mut dp_buf, W * dp_size);
+        scratch_uninit(&mut scores_buf, W * num_gaps);
+        scratch_uninit_u8(&mut codes, codes_needed);
 
-        // Write results.
-        for lane in 0..W {
-            for k in 0..num_gaps {
-                table[k][base_s + lane] = scores_buf[lane * num_gaps + k];
-            }
+        for (i, c) in codes.iter_mut().enumerate() {
+            *c = NT_NIBBLE_LUT[(seq[i] & 0x0F) as usize];
         }
-    }
 
-    // Handle remainder positions one at a time.
-    if remainder > 0 {
-        let dp_one_size = (seq_len + 1) * dp_cols;
-        let mut align = vec![f64::NEG_INFINITY; dp_one_size];
-        let mut sc = vec![0.0f64; num_gaps];
+        for chunk in 0..full_chunks {
+            let base_s = chunk * W;
 
-        let flat64: Vec<f64> = flat_profile.iter().map(|&v| v as f64).collect();
-        let gap64: Vec<f64> = gap_profile.iter().map(|&v| v as f64).collect();
-
-        for r in 0..remainder {
-            let s = full_chunks * W + r;
-            strand_dp_scalar(
-                &seq[s..], seq_len, prof_len, max_gaps, min_len,
-                &flat64, &gap64, &mut align, dp_cols, &mut sc,
+            // Reset and fill W DP tables in parallel.
+            multi_dp_w::<W>(
+                &codes, base_s, seq_len, prof_len, max_gaps, min_len,
+                prof_t, gap_profile, dp_cols,
+                &mut dp_buf, &mut scores_buf,
             );
-            for k in 0..num_gaps {
-                table[k][s] = sc[k] as f32;
+
+            // Write results.
+            for lane in 0..W {
+                for k in 0..num_gaps {
+                    table[k][base_s + lane] = scores_buf[lane * num_gaps + k];
+                }
             }
         }
-    }
+
+        // Handle remainder positions one at a time using the scalar path.
+        if remainder > 0 {
+            SCRATCH_ALIGN_F64.with(|al_cell| {
+            SCRATCH_FLAT_PROF_F64.with(|flat_cell| {
+            SCRATCH_GAP_PROF_F64.with(|gap_cell| {
+            SCRATCH_SCORES_F64.with(|sc64_cell| {
+                let mut align = al_cell.borrow_mut();
+                let mut flat64 = flat_cell.borrow_mut();
+                let mut gap64 = gap_cell.borrow_mut();
+                let mut sc = sc64_cell.borrow_mut();
+
+                scratch_uninit(&mut align, dp_size);
+                if flat64.len() != flat_profile.len() {
+                    flat64.clear();
+                    flat64.extend(flat_profile.iter().map(|&v| v as f64));
+                } else {
+                    for (dst, &src) in flat64.iter_mut().zip(flat_profile.iter()) {
+                        *dst = src as f64;
+                    }
+                }
+                if gap64.len() != gap_profile.len() {
+                    gap64.clear();
+                    gap64.extend(gap_profile.iter().map(|&v| v as f64));
+                } else {
+                    for (dst, &src) in gap64.iter_mut().zip(gap_profile.iter()) {
+                        *dst = src as f64;
+                    }
+                }
+                scratch_uninit(&mut sc, num_gaps);
+
+                for r in 0..remainder {
+                    let s = full_chunks * W + r;
+                    strand_dp_scalar(
+                        &seq[s..], seq_len, prof_len, max_gaps, min_len,
+                        &flat64, &gap64, &mut align, dp_cols, &mut sc,
+                    );
+                    for k in 0..num_gaps {
+                        table[k][s] = sc[k] as f32;
+                    }
+                }
+            });
+            });
+            });
+            });
+        }
+    });
+    });
+    });
 }
 
 /// Run W independent DP instances on consecutive scan positions.
@@ -343,17 +455,21 @@ pub fn compute_strand_score_table_gapped_into(
 /// Uses interleaved SOA layout: dp_buf[(i * dp_cols + j) * W + lane]
 /// so that all W lanes for the same cell are adjacent in memory,
 /// enabling the compiler to auto-vectorize the inner lane loop.
+///
+/// `seq_codes` is the entire scan window encoded once via NT_NIBBLE_LUT, so
+/// per-lane lookups inside the DP fill become a single byte read (no LUT in
+/// the hot loop). `prof_t[j * 8 + code]` is the column-major transposed
+/// profile — the per-lane gather hits a 32-byte cache line on every column.
 fn multi_dp_w<const W: usize>(
-    seq: &[u8],
+    seq_codes: &[u8],
     base_s: usize,
     seq_len: usize,
     prof_len: usize,
     max_gaps: usize,
     min_len: usize,
-    flat_profile: &[f32],
+    prof_t: &[f32],
     gap_profile: &[f32],
     dp_cols: usize,
-    _dp_size: usize,
     dp_buf: &mut [f32],
     scores_buf: &mut [f32],
 ) {
@@ -389,10 +505,11 @@ fn multi_dp_w<const W: usize>(
     for row in 1..=seq_len {
         let cell_idx = row * dp_cols + row;
         let prev_cell_idx = (row - 1) * dp_cols + (row - 1);
+        let col_base = (row - 1) * 8;
         for lane in 0..W {
             let s = base_s + lane;
-            let code = nt_strand_code(seq[s + row - 1]);
-            let prof_val = flat_profile[code * prof_len + (row - 1)];
+            let code = seq_codes[s + row - 1] as usize;
+            let prof_val = prof_t[col_base + code];
             dp_buf[cell_idx * W + lane] = dp_buf[prev_cell_idx * W + lane] + prof_val;
         }
     }
@@ -401,11 +518,11 @@ fn multi_dp_w<const W: usize>(
     for i in 1..=seq_len {
         let jmax = (i + max_gaps).min(prof_len);
 
-        // Precompute profile values for each lane at row i.
-        // codes[lane] = nt_code of seq byte at position base_s + lane + i - 1.
-        let mut codes = [0usize; 8]; // padded for alignment
+        // Precompute the lane codes once per row i (same code for every j in
+        // this row).
+        let mut codes = [0u8; 8];
         for lane in 0..W {
-            codes[lane] = nt_strand_code(seq[base_s + lane + i - 1]);
+            codes[lane] = seq_codes[base_s + lane + i - 1];
         }
 
         for j in (i + 1)..=jmax {
@@ -413,9 +530,14 @@ fn multi_dp_w<const W: usize>(
             let diag_cell = ((i - 1) * dp_cols + (j - 1)) * W;
             let horiz_cell = (i * dp_cols + (j - 1)) * W;
             let dest_cell = (i * dp_cols + j) * W;
+            let col_base = (j - 1) * 8;
 
             for lane in 0..W {
-                let prof_val = flat_profile[codes[lane] * prof_len + (j - 1)];
+                // Per-lane gather into one 32-byte row of prof_t — all 4 lanes
+                // hit the same cache line. Strided gather into the row-major
+                // `flat_profile[code * prof_len + j]` was a much wider stride
+                // (prof_len * 4 bytes per lane).
+                let prof_val = prof_t[col_base + codes[lane] as usize];
                 let diag = dp_buf[diag_cell + lane] + prof_val;
                 let horiz = dp_buf[horiz_cell + lane] + gap_val;
                 dp_buf[dest_cell + lane] = diag.max(horiz);

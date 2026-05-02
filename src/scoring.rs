@@ -1,6 +1,35 @@
+use std::cell::RefCell;
+
 use crate::profile::{nt_helix_code, nt_strand_code};
 use crate::simd;
 use crate::types::*;
+
+thread_local! {
+    /// Per-thread scratch for `score_strand_run_dp`'s DP buffer (`align`) and
+    /// pre-encoded query codes. The DP path is called once per
+    /// (variable strand × DMP hit candidate); pooling these avoids two heap
+    /// allocations per call. The buffer can shrink between calls but never
+    /// frees its capacity.
+    static SCRATCH_DP_ALIGN_F64: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
+    static SCRATCH_DP_CODES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    /// Per-thread scratch for `score_configs_direct_with`'s per-mask working
+    /// vectors (st_fixed/hx_fixed/upper-bound/suffix-max). The DMP path calls
+    /// score_configs_direct_with once per surviving level-1+ candidate; on
+    /// large IB intron scans this can be hundreds of calls and the small
+    /// per-call Vec allocations add up.
+    static SCRATCH_FIXED: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+    static SCRATCH_UPPER: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
+    static SCRATCH_SUFFIX: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
+}
+
+#[inline]
+fn ensure_len_f64(buf: &mut Vec<f64>, len: usize, fill: f64) {
+    if buf.len() < len {
+        buf.resize(len, fill);
+    } else {
+        buf.truncate(len);
+    }
+}
 
 /// Precomputed score tables for all elements in a mask.
 pub struct ScoreTables {
@@ -84,16 +113,11 @@ pub fn compute_mask_score_tables_into(
         let strand = &pattern.strands[idx];
         let dst = &mut tables.strand_scores[i];
         if strand.max_gaps == 0 {
-            // No-gap strands have a single gap variant; reuse the inner Vec<f32>.
             dst.truncate(1);
             while dst.len() < 1 {
                 dst.push(Vec::new());
             }
             simd::compute_strand_score_table_nogap_into(seq, strand, &mut dst[0]);
-            if dst[0].is_empty() {
-                // Sequence was shorter than the strand: keep an empty vec to
-                // mirror the legacy `vec![vec![]; 1]` behaviour.
-            }
         } else {
             simd::compute_strand_score_table_gapped_into(seq, strand, dst);
         }
@@ -447,151 +471,79 @@ pub fn score_configs_direct_with(
     }
 
     let ref0 = &configs[0];
+    let nst = mask.st_indices.len();
+    let nhx = mask.hx_indices.len();
+    let n_total = nst + nhx;
 
-    // Identify fixed strands: same (bgn, gaps) across all configs.
-    let st_fixed: Vec<bool> = (0..mask.st_indices.len())
-        .map(|s| {
-            configs
-                .iter()
-                .all(|c| c.st_bgn[s] == ref0.st_bgn[s] && c.st_gaps[s] == ref0.st_gaps[s])
-        })
-        .collect();
+    SCRATCH_FIXED.with(|fx_cell| {
+    SCRATCH_UPPER.with(|up_cell| {
+    SCRATCH_SUFFIX.with(|sf_cell| {
+        let mut fixed_buf = fx_cell.borrow_mut();
+        let mut upper_buf = up_cell.borrow_mut();
+        let mut suffix_buf = sf_cell.borrow_mut();
 
-    // Identify fixed helices: same (bgn, gaps) across all configs.
-    let hx_fixed: Vec<bool> = (0..mask.hx_indices.len())
-        .map(|h| {
-            configs
-                .iter()
-                .all(|c| c.hx_bgn[h] == ref0.hx_bgn[h] && c.hx_gaps[h] == ref0.hx_gaps[h])
-        })
-        .collect();
-
-    // Score fixed elements once.
-    let mut fixed_score = 0.0f64;
-    let mut fixed_valid = true;
-
-    for (s, &st_idx) in mask.st_indices.iter().enumerate() {
-        if !st_fixed[s] {
-            continue;
+        // fixed_buf layout: [st_fixed (nst); hx_fixed (nhx)]. upper_buf
+        // layout: [st_upper (nst); hx_upper (nhx)]. suffix_buf: n_total + 1.
+        if fixed_buf.len() < n_total {
+            fixed_buf.resize(n_total, false);
+        } else {
+            fixed_buf.truncate(n_total);
         }
-        let strand = &pattern.strands[st_idx];
-        let pos = seq_pos + ref0.st_bgn[s];
-        let len = strand.min_len + ref0.st_gaps[s];
-        if pos + len > seq.len() {
-            fixed_valid = false;
-            break;
+        if upper_buf.len() < n_total {
+            upper_buf.resize(n_total, 0.0);
+        } else {
+            upper_buf.truncate(n_total);
         }
-        fixed_score += score_strand_run(strand, &seq[pos..pos + len]);
-    }
+        if suffix_buf.len() < n_total + 1 {
+            suffix_buf.resize(n_total + 1, 0.0);
+        } else {
+            suffix_buf.truncate(n_total + 1);
+        }
 
-    if fixed_valid {
-        for (h, &hx_idx) in mask.hx_indices.iter().enumerate() {
-            if !hx_fixed[h] {
+        // Identify fixed strands and helices.
+        for s in 0..nst {
+            fixed_buf[s] = configs.iter().all(|c| {
+                c.st_bgn[s] == ref0.st_bgn[s] && c.st_gaps[s] == ref0.st_gaps[s]
+            });
+        }
+        for h in 0..nhx {
+            fixed_buf[nst + h] = configs.iter().all(|c| {
+                c.hx_bgn[h] == ref0.hx_bgn[h] && c.hx_gaps[h] == ref0.hx_gaps[h]
+            });
+        }
+
+        // Score fixed elements once.
+        let mut fixed_score = 0.0f64;
+        let mut fixed_valid = true;
+
+        for (s, &st_idx) in mask.st_indices.iter().enumerate() {
+            if !fixed_buf[s] {
                 continue;
             }
-            let helix = &pattern.helices[hx_idx];
-            let pos5 = seq_pos + ref0.hx_bgn[h];
-            let dist = helix.min_dist + ref0.hx_gaps[h];
-            let pos3 = pos5 + helix.helix_len + dist;
-            if pos3 + helix.helix_len > seq.len() {
+            let strand = &pattern.strands[st_idx];
+            let pos = seq_pos + ref0.st_bgn[s];
+            let len = strand.min_len + ref0.st_gaps[s];
+            if pos + len > seq.len() {
                 fixed_valid = false;
                 break;
             }
-            fixed_score += score_helix_run(helix, &seq[pos5..pos5 + helix.helix_len], &seq[pos3..pos3 + helix.helix_len]);
-        }
-    }
-
-    if !fixed_valid {
-        return (f64::NEG_INFINITY, 0);
-    }
-
-    // Per-variable-element upper bounds: precomputed on Strand/Helix at
-    // pattern build (sum of per-column max profile value). Used for early
-    // termination on the same model as `ConfigLookup`'s suffix_max.
-    let st_upper: Vec<f64> = mask
-        .st_indices
-        .iter()
-        .enumerate()
-        .map(|(s, &idx)| if st_fixed[s] { 0.0 } else { pattern.strands[idx].upper_bound })
-        .collect();
-    let hx_upper: Vec<f64> = mask
-        .hx_indices
-        .iter()
-        .enumerate()
-        .map(|(h, &idx)| if hx_fixed[h] { 0.0 } else { pattern.helices[idx].upper_bound })
-        .collect();
-
-    // suffix_max ordered as: [strand vars in iter order] then [helix vars in iter order].
-    // suffix_max[i] = sum of upper bounds for ALL variable elements at positions ≥ i,
-    // both remaining strands and all helices when i < nst, and remaining helices
-    // when i >= nst. Building this as a single backward sweep over the
-    // concatenated upper-bound array ensures the strand-loop prune check
-    // accounts for the helix contribution that comes later — without that,
-    // valid configs where the helices carry most of the score get pruned.
-    let nst = mask.st_indices.len();
-    let nhx = mask.hx_indices.len();
-    let mut suffix_max = vec![0.0f64; nst + nhx + 1];
-    for h in (0..nhx).rev() {
-        suffix_max[nst + h] = suffix_max[nst + h + 1] + hx_upper[h];
-    }
-    for s in (0..nst).rev() {
-        suffix_max[s] = suffix_max[s + 1] + st_upper[s];
-    }
-
-    // Score variable elements per-config.
-    let mut best_score = f64::NEG_INFINITY;
-    let mut best_idx = 0;
-
-    for (cfg_idx, cfg) in configs.iter().enumerate() {
-        if seq_pos + cfg.len > seq.len() {
-            continue;
+            fixed_score += score_strand_run(strand, &seq[pos..pos + len]);
         }
 
-        let mut score = fixed_score;
-        let mut valid = true;
-        // Pruning target: a config must beat both the existing best and the
-        // mask threshold to be a useful hit.
-        let target = best_score.max(threshold);
-
-        // Strand variables first (their order matches suffix_max indices 0..nst).
-        for (s, &st_idx) in mask.st_indices.iter().enumerate() {
-            if st_fixed[s] {
-                continue;
-            }
-            // Partial + every remaining var's upper bound — if this can't
-            // exceed target there's no way this config wins. Skip the rest.
-            if score + suffix_max[s] <= target {
-                valid = false;
-                break;
-            }
-            let strand = &pattern.strands[st_idx];
-            let pos = seq_pos + cfg.st_bgn[s];
-            let len = strand.min_len + cfg.st_gaps[s];
-            if pos + len > seq.len() {
-                valid = false;
-                break;
-            }
-            score += score_strand_run(strand, &seq[pos..pos + len]);
-        }
-
-        if valid {
+        if fixed_valid {
             for (h, &hx_idx) in mask.hx_indices.iter().enumerate() {
-                if hx_fixed[h] {
+                if !fixed_buf[nst + h] {
                     continue;
                 }
-                if score + suffix_max[nst + h] <= target {
-                    valid = false;
-                    break;
-                }
                 let helix = &pattern.helices[hx_idx];
-                let pos5 = seq_pos + cfg.hx_bgn[h];
-                let dist = helix.min_dist + cfg.hx_gaps[h];
+                let pos5 = seq_pos + ref0.hx_bgn[h];
+                let dist = helix.min_dist + ref0.hx_gaps[h];
                 let pos3 = pos5 + helix.helix_len + dist;
                 if pos3 + helix.helix_len > seq.len() {
-                    valid = false;
+                    fixed_valid = false;
                     break;
                 }
-                score += score_helix_run(
+                fixed_score += score_helix_run(
                     helix,
                     &seq[pos5..pos5 + helix.helix_len],
                     &seq[pos3..pos3 + helix.helix_len],
@@ -599,13 +551,99 @@ pub fn score_configs_direct_with(
             }
         }
 
-        if valid && score > best_score {
-            best_score = score;
-            best_idx = cfg_idx;
+        if !fixed_valid {
+            return (f64::NEG_INFINITY, 0);
         }
-    }
 
-    (best_score, best_idx)
+        // Per-variable-element upper bounds.
+        for (s, &idx) in mask.st_indices.iter().enumerate() {
+            upper_buf[s] = if fixed_buf[s] {
+                0.0
+            } else {
+                pattern.strands[idx].upper_bound
+            };
+        }
+        for (h, &idx) in mask.hx_indices.iter().enumerate() {
+            upper_buf[nst + h] = if fixed_buf[nst + h] {
+                0.0
+            } else {
+                pattern.helices[idx].upper_bound
+            };
+        }
+
+        // suffix_max[i] = sum of upper bounds for all variable elements at
+        // positions ≥ i (single backward sweep over concatenated st+hx bounds).
+        suffix_buf[n_total] = 0.0;
+        for i in (0..n_total).rev() {
+            suffix_buf[i] = suffix_buf[i + 1] + upper_buf[i];
+        }
+
+        // Score variable elements per-config.
+        let mut best_score = f64::NEG_INFINITY;
+        let mut best_idx = 0;
+
+        for (cfg_idx, cfg) in configs.iter().enumerate() {
+            if seq_pos + cfg.len > seq.len() {
+                continue;
+            }
+
+            let mut score = fixed_score;
+            let mut valid = true;
+            let target = best_score.max(threshold);
+
+            for (s, &st_idx) in mask.st_indices.iter().enumerate() {
+                if fixed_buf[s] {
+                    continue;
+                }
+                if score + suffix_buf[s] <= target {
+                    valid = false;
+                    break;
+                }
+                let strand = &pattern.strands[st_idx];
+                let pos = seq_pos + cfg.st_bgn[s];
+                let len = strand.min_len + cfg.st_gaps[s];
+                if pos + len > seq.len() {
+                    valid = false;
+                    break;
+                }
+                score += score_strand_run(strand, &seq[pos..pos + len]);
+            }
+
+            if valid {
+                for (h, &hx_idx) in mask.hx_indices.iter().enumerate() {
+                    if fixed_buf[nst + h] {
+                        continue;
+                    }
+                    if score + suffix_buf[nst + h] <= target {
+                        valid = false;
+                        break;
+                    }
+                    let helix = &pattern.helices[hx_idx];
+                    let pos5 = seq_pos + cfg.hx_bgn[h];
+                    let dist = helix.min_dist + cfg.hx_gaps[h];
+                    let pos3 = pos5 + helix.helix_len + dist;
+                    if pos3 + helix.helix_len > seq.len() {
+                        valid = false;
+                        break;
+                    }
+                    score += score_helix_run(
+                        helix,
+                        &seq[pos5..pos5 + helix.helix_len],
+                        &seq[pos3..pos3 + helix.helix_len],
+                    );
+                }
+            }
+
+            if valid && score > best_score {
+                best_score = score;
+                best_idx = cfg_idx;
+            }
+        }
+
+        (best_score, best_idx)
+    })
+    })
+    })
 }
 
 /// Score a contiguous run of `seq.len()` bases against the leading columns
@@ -653,45 +691,84 @@ fn score_strand_run_dp(strand: &Strand, seq: &[u8]) -> f64 {
     let n = strand.max_len;
     let max_gaps = strand.max_gaps;
     let prof = strand.profile_f32.as_slice();
-
-    // Pre-encode query bases.
-    let codes: Vec<usize> = (0..m).map(|i| nt_strand_code(seq[i])).collect();
-
-    // align[i][j]: best score aligning first i query bases to first j profile
-    // cols. Band constraint: 0 <= j - i <= max_gaps. Out-of-band cells stay
-    // NEG_INFINITY and are never read by the in-band recurrence.
     let stride = n + 1;
-    let mut align = vec![f64::NEG_INFINITY; (m + 1) * stride];
-    align[0] = 0.0;
 
-    // Row 0 (pure-insertion path): align[0][j] = align[0][j-1] + prof[gap_row, j-1].
-    // Profile row 4 = gap row in Rust's strand layout (NT_STRAND_LUT).
-    let prof_x_offset = 4 * n;
-    for j in 1..=max_gaps.min(n) {
-        align[j] = align[j - 1] + prof[prof_x_offset + j - 1] as f64;
+    SCRATCH_DP_ALIGN_F64.with(|al_cell| {
+        SCRATCH_DP_CODES.with(|cd_cell| {
+            let mut align = al_cell.borrow_mut();
+            let mut codes = cd_cell.borrow_mut();
+
+            // Pre-encode query bases. Reuse codes buffer.
+            ensure_len_usize(&mut codes, m);
+            for i in 0..m {
+                codes[i] = nt_strand_code(seq[i]);
+            }
+
+            // align[i][j]: best score aligning first i query bases to first j
+            // profile cols. Band constraint: 0 <= j - i <= max_gaps. Out-of-band
+            // cells stay NEG_INFINITY and are never read by the in-band
+            // recurrence. Initialize the whole buffer to NEG_INFINITY only on
+            // grow; on reuse we overwrite the band cells before reading them
+            // and the out-of-band cells must remain NEG_INFINITY (in case a
+            // prior call's max_gaps was wider than this call's). Easiest: just
+            // re-fill the band region.
+            let needed = (m + 1) * stride;
+            ensure_len_f64(&mut align, needed, f64::NEG_INFINITY);
+            // The recurrence reads (i-1, j-1) for diag and (i, j-1) for horiz.
+            // Both writes are inside the band [i, i+max_gaps], so any
+            // out-of-band leftovers from a prior call must stay NEG_INFINITY
+            // OR we must overwrite with NEG_INFINITY in the band region.
+            // Since we may have shrunk from a wider band before, force-reset
+            // the band cells to NEG_INFINITY and write the in-band values
+            // explicitly. Easier and correct: zero (set NEG_INFINITY) the
+            // entire `needed` region. Costs O(m * n) — but m, n are tiny
+            // (single-digit) so this is cheap relative to the DP.
+            for v in align.iter_mut().take(needed) {
+                *v = f64::NEG_INFINITY;
+            }
+            align[0] = 0.0;
+
+            // Row 0 (pure-insertion path).
+            let prof_x_offset = 4 * n;
+            for j in 1..=max_gaps.min(n) {
+                align[j] = align[j - 1] + prof[prof_x_offset + j - 1] as f64;
+            }
+
+            // Diagonal.
+            let limit_diag = m.min(n);
+            for j in 1..=limit_diag {
+                let code = codes[j - 1];
+                let v = prof[code * n + j - 1] as f64;
+                align[j * stride + j] = align[(j - 1) * stride + (j - 1)] + v;
+            }
+
+            // In-band fill.
+            for i in 1..=m {
+                let jmax = (i + max_gaps).min(n);
+                let code = codes[i - 1];
+                let prof_row_off = code * n;
+                for j in (i + 1)..=jmax {
+                    let jm1 = j - 1;
+                    let match_score =
+                        align[(i - 1) * stride + jm1] + prof[prof_row_off + jm1] as f64;
+                    let gap_score =
+                        align[i * stride + jm1] + prof[prof_x_offset + jm1] as f64;
+                    align[i * stride + j] = match_score.max(gap_score);
+                }
+            }
+
+            align[m * stride + n]
+        })
+    })
+}
+
+#[inline]
+fn ensure_len_usize(buf: &mut Vec<usize>, len: usize) {
+    if buf.len() < len {
+        buf.resize(len, 0);
+    } else {
+        buf.truncate(len);
     }
-
-    // Diagonal: align[j][j] = align[j-1][j-1] + prof[code(seq[j-1]), j-1].
-    let limit_diag = m.min(n);
-    for j in 1..=limit_diag {
-        let code = codes[j - 1];
-        let v = prof[code * n + j - 1] as f64;
-        align[j * stride + j] = align[(j - 1) * stride + (j - 1)] + v;
-    }
-
-    // In-band fill: for i in 1..=m, j in (i+1)..=min(n, i+max_gaps).
-    for i in 1..=m {
-        let jmax = (i + max_gaps).min(n);
-        for j in (i + 1)..=jmax {
-            let jm1 = j - 1;
-            let code = codes[i - 1];
-            let match_score = align[(i - 1) * stride + jm1] + prof[code * n + jm1] as f64;
-            let gap_score = align[i * stride + jm1] + prof[prof_x_offset + jm1] as f64;
-            align[i * stride + j] = match_score.max(gap_score);
-        }
-    }
-
-    align[m * stride + n]
 }
 
 /// Score a helix's two strands of length `helix.helix_len` each. The 3'

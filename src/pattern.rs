@@ -1,4 +1,4 @@
-use crate::profile::{self, Background};
+use crate::profile::{self, Background, DINUC_LUT};
 use crate::types::*;
 
 /// Maximum partial sum of per-column maxima over valid lengths
@@ -58,6 +58,49 @@ fn flatten_profile_f32(profile: &[Vec<f64>], cols: usize) -> Vec<f32> {
         }
     }
     flat
+}
+
+/// Build a column-major transposed profile with `stride` elements per column
+/// (≥ profile.len(); extra slots zero-padded). Layout: `flat[j * stride + code]`.
+/// This is what the SIMD score-table routines used to stage per call into
+/// `col_vals`; caching it on the Strand/Helix saves the per-call O(cols *
+/// stride) copy and lets the gapped-strand DP do cache-friendly per-lane
+/// gathers (each column's row of `stride` f32 fits in a single cache line).
+fn flatten_profile_f32_t(profile: &[Vec<f64>], cols: usize, stride: usize) -> Vec<f32> {
+    debug_assert!(profile.len() <= stride);
+    let mut flat = vec![0.0f32; cols * stride];
+    for (code, row) in profile.iter().enumerate() {
+        for (j, &v) in row.iter().enumerate() {
+            if j < cols {
+                flat[j * stride + code] = v as f32;
+            }
+        }
+    }
+    flat
+}
+
+/// Build a per-column dinucleotide pair score table for a helix, stride 64
+/// (8 c5 classes × 8 c3 classes, with the upper rows/cols zero-padded).
+/// `pair[j * 64 + (c5 * 8 + c3)] = profile[DINUC_LUT[c5][c3]][j]`. Folds the
+/// two-step lookup `(c5, c3) → DINUC_LUT → profile_f32_t` into a single read
+/// in the SIMD helix score-table inner loop. Building this once amortizes
+/// the dinuc indirection over thousands of scan windows.
+fn build_helix_pair_table(profile: &[Vec<f64>], helix_len: usize) -> Vec<f32> {
+    let mut pair = vec![0.0f32; helix_len * 64];
+    for j in 0..helix_len {
+        for c5 in 0..7 {
+            for c3 in 0..7 {
+                let code = DINUC_LUT[c5][c3] as usize;
+                let v = if code < profile.len() && j < profile[code].len() {
+                    profile[code][j] as f32
+                } else {
+                    0.0
+                };
+                pair[j * 64 + (c5 * 8 + c3)] = v;
+            }
+        }
+    }
+    pair
 }
 
 /// Build a Pattern from a training set and region specification.
@@ -124,6 +167,10 @@ pub fn build_pattern(
             let hx_idx = helices.len();
             helix_map.insert(code, hx_idx);
             let profile_f32 = flatten_profile_f32(&profile, helix_len);
+            // Stride 32 = next power of two ≥ DINUC_CODES (26). Pads the 6
+            // unused rows with 0.0 so the SIMD inner loop never reads them.
+            let profile_f32_t = flatten_profile_f32_t(&profile, helix_len, 32);
+            let pair_table = build_helix_pair_table(&profile, helix_len);
             // Helices score over a fixed `helix_len` columns regardless of
             // gap configuration (the gap is *between* the two strands, not
             // within them), so min == max here.
@@ -141,6 +188,8 @@ pub fn build_pattern(
                 min_bgn: 0, // set below
                 profile,
                 profile_f32,
+                profile_f32_t,
+                pair_table,
                 upper_bound,
             });
         } else if runs_for_code.len() == 1 {
@@ -153,6 +202,9 @@ pub fn build_pattern(
             let st_idx = strands.len();
             strand_map.insert(code, st_idx);
             let profile_f32 = flatten_profile_f32(&profile, run.num_cols);
+            // Stride 8 = next power of two ≥ NT_CODES (6). Pads codes 6..7 with
+            // zero so the inner loop indexes without bounds checks.
+            let profile_f32_t = flatten_profile_f32_t(&profile, run.num_cols, 8);
             // Strands score over `min_len + gap` columns, with gap in
             // `[0, max_gaps]`. The trailing columns can have negative max
             // values, so the true upper bound is the max prefix sum over
@@ -168,6 +220,7 @@ pub fn build_pattern(
                 min_bgn: 0, // set below
                 profile,
                 profile_f32,
+                profile_f32_t,
                 upper_bound,
             });
         }

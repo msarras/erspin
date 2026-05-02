@@ -91,6 +91,19 @@ pub struct Helix {
     /// f32 flat-strided copy of `profile` for SIMD scoring.
     /// Layout: `profile_f32[code * helix_len + j]`, length = `DINUC_CODES` * helix_len.
     pub profile_f32: Vec<f32>,
+    /// Column-major transposed profile, stride 32 (next power of two ≥
+    /// DINUC_CODES). Layout: `profile_f32_t[j * 32 + code]`, length = 32 *
+    /// helix_len. Codes ≥ DINUC_CODES are zero-padded so the SIMD inner loop
+    /// can index without bounds checks. This is the same staging the SIMD
+    /// score-table fns used to build per-call; caching it on the helix saves
+    /// one full O(helix_len * 32) copy per (helix × scan call).
+    pub profile_f32_t: Vec<f32>,
+    /// Per-column flattened dinucleotide score table, stride 64 (8 c5 classes
+    /// × 8 c3 classes, padded). Layout: `pair_table[j * 64 + (c5 * 8 + c3)]`,
+    /// length = 64 * helix_len. Folds the two-step lookup (helix-class codes →
+    /// `DINUC_LUT` → `profile_f32_t`) into a single direct table read in the
+    /// score-table inner loop. Built once at pattern construction.
+    pub pair_table: Vec<f32>,
     /// Per-column-max sum: an upper bound on the score this helix can ever
     /// contribute. Used by the DMP scorer for early-termination pruning. Stable
     /// once `profile` is built, so cache it instead of recomputing per hit.
@@ -114,6 +127,12 @@ pub struct Strand {
     /// f32 flat-strided copy of `profile` for SIMD scoring.
     /// Layout: `profile_f32[code * max_len + j]`, length = 6 * max_len.
     pub profile_f32: Vec<f32>,
+    /// Column-major transposed profile, stride 8 (next power of two ≥ NT_CODES).
+    /// Layout: `profile_f32_t[j * 8 + code]`, length = 8 * max_len. Codes ≥ 6
+    /// are zero-padded. Saves the per-call staging copy in the SIMD strand-table
+    /// fns and gives the gapped-strand DP a cache-line-friendly per-lane gather:
+    /// all four lanes for the same column hit a single 32-byte line.
+    pub profile_f32_t: Vec<f32>,
     /// Per-column-max sum: upper bound on this strand's contribution. Same
     /// purpose as `Helix::upper_bound`.
     pub upper_bound: f64,
