@@ -6,8 +6,35 @@
 //! Strategy: process multiple scan positions simultaneously by reordering loops
 //! from position-major (for s { for j }) to column-major (for j { for s }).
 
-use crate::profile::{nt_helix_code, nt_strand_code, LOG_ZERO};
+use crate::profile::{self, nt_strand_code, DINUC_LUT, LOG_ZERO};
 use crate::types::*;
+
+/// Resize `table` to have exactly `outer_len` inner buffers, each with
+/// `inner_len` accessible elements. Inner contents are uninitialized;
+/// callers MUST overwrite every position they intend to read. Reuses the
+/// existing `Vec<f32>` allocations when possible so per-thread scratch
+/// buffers stay hot.
+///
+/// SAFETY: callers must write to every index in `0..inner_len` before reading
+/// any element. The score table fns do this either by assigning on the first
+/// profile column (helix, no-gap strand) or by row-by-row assignment (gapped
+/// strand DP, multi_dp_w writes scores_buf into table[k][s] for every s).
+#[inline]
+fn shape_table_uninit(table: &mut Vec<Vec<f32>>, outer_len: usize, inner_len: usize) {
+    table.truncate(outer_len);
+    while table.len() < outer_len {
+        table.push(Vec::new());
+    }
+    for inner in table.iter_mut() {
+        inner.clear();
+        inner.reserve(inner_len);
+        // SAFETY: we just reserved `inner_len` capacity; bytes are
+        // uninitialized but safe to set len since callers will overwrite.
+        unsafe {
+            inner.set_len(inner_len);
+        }
+    }
+}
 
 /// Precomputed lookup table: low nibble of ASCII byte → nucleotide code (0-5).
 ///
@@ -21,123 +48,203 @@ const NT_NIBBLE_LUT: [u8; 16] = [5, 0, 5, 3, 1, 5, 5, 2, 5, 5, 5, 5, 5, 4, 5, 5]
 /// This reorders the computation so the inner loop scans across positions
 /// for a fixed profile column, which is much more SIMD-friendly.
 pub fn compute_strand_score_table_nogap(seq: &[u8], strand: &Strand) -> Vec<f32> {
+    let mut scores = Vec::new();
+    compute_strand_score_table_nogap_into(seq, strand, &mut scores);
+    scores
+}
+
+/// Same as [`compute_strand_score_table_nogap`] but writes into an existing
+/// `Vec<f32>` so callers can pool the allocation across sequences.
+pub fn compute_strand_score_table_nogap_into(seq: &[u8], strand: &Strand, scores: &mut Vec<f32>) {
     let max_len = strand.max_len;
     let scan_len = if seq.len() >= max_len {
         seq.len() - max_len + 1
     } else {
-        return Vec::new();
+        scores.clear();
+        return;
     };
 
-    // Precompute per-column lookup: for each column j, store the 6 profile values
-    // as f32 in a small array indexed by nucleotide code.
-    let mut col_vals = vec![[0.0f32; 8]; max_len]; // padded to 8 for alignment
+    // Precomputed per-column lookup lives on the Strand: layout is
+    // `profile_f32[code * max_len + j]` (6 codes × max_len). Stage it into
+    // [code; 8] arrays per column so the inner loop can index by code with
+    // a power-of-two stride that the compiler vectorizes cleanly.
+    let mut col_vals = vec![[0.0f32; 8]; max_len];
     for j in 0..max_len {
         for code in 0..6 {
-            col_vals[j][code] = strand.profile[code][j] as f32;
+            col_vals[j][code] = strand.profile_f32[code * max_len + j];
         }
     }
 
-    let mut scores = vec![0.0f32; scan_len];
+    scores.clear();
+    scores.reserve(scan_len);
+    // SAFETY: the j == 0 pass below assigns every position in 0..scan_len
+    // before any reader looks at the buffer, so leaving the bytes
+    // uninitialized briefly is fine.
+    unsafe {
+        scores.set_len(scan_len);
+    }
 
-    // Column-major: for each profile column j, accumulate across all positions.
-    for j in 0..max_len {
-        let vals = &col_vals[j];
+    // Column-major: j == 0 assigns the running total (no zero-init pass
+    // needed); j > 0 accumulates. Skipping the resize-with-zero saves one
+    // full memory-bandwidth pass over the table.
+    let chunks = scan_len / 8;
+    let remainder = scan_len % 8;
 
-        // Precompute codes for this column offset across all positions.
-        // seq[s + j] for s in 0..scan_len → codes stored as bytes.
-        let seq_slice = &seq[j..j + scan_len];
-
-        // Process 8 positions at a time using scalar code that the compiler
-        // can auto-vectorize.
-        let chunks = scan_len / 8;
-        let remainder = scan_len % 8;
-
+    // j == 0: assignment.
+    {
+        let vals = &col_vals[0];
+        let seq_slice = &seq[0..scan_len];
         for chunk in 0..chunks {
             let base = chunk * 8;
-            // Unroll 8 iterations to help auto-vectorization.
+            for k in 0..8 {
+                let code = NT_NIBBLE_LUT[(seq_slice[base + k] & 0x0F) as usize];
+                scores[base + k] = vals[code as usize];
+            }
+        }
+        let base = chunks * 8;
+        for k in 0..remainder {
+            let code = NT_NIBBLE_LUT[(seq_slice[base + k] & 0x0F) as usize];
+            scores[base + k] = vals[code as usize];
+        }
+    }
+
+    // j == 1..max_len: accumulation.
+    for j in 1..max_len {
+        let vals = &col_vals[j];
+        let seq_slice = &seq[j..j + scan_len];
+        for chunk in 0..chunks {
+            let base = chunk * 8;
             for k in 0..8 {
                 let code = NT_NIBBLE_LUT[(seq_slice[base + k] & 0x0F) as usize];
                 scores[base + k] += vals[code as usize];
             }
         }
-
-        // Handle remainder.
         let base = chunks * 8;
         for k in 0..remainder {
             let code = NT_NIBBLE_LUT[(seq_slice[base + k] & 0x0F) as usize];
             scores[base + k] += vals[code as usize];
         }
     }
-
-    scores
 }
 
 /// Compute score table for a helix using column-major loop order.
 ///
 /// For each gap variant k and profile column j, accumulates scores across all positions.
 pub fn compute_helix_score_table(seq: &[u8], helix: &Helix) -> Vec<Vec<f32>> {
+    let mut table = Vec::new();
+    compute_helix_score_table_into(seq, helix, &mut table);
+    table
+}
+
+/// Same as [`compute_helix_score_table`] but reuses an existing
+/// `Vec<Vec<f32>>` so callers can pool the per-gap-variant inner buffers.
+pub fn compute_helix_score_table_into(
+    seq: &[u8],
+    helix: &Helix,
+    table: &mut Vec<Vec<f32>>,
+) {
+    let num_gaps = helix.max_gaps + 1;
     let scan_len = if seq.len() >= helix.max_len {
         seq.len() - helix.max_len + 1
     } else {
-        return vec![vec![]; helix.max_gaps + 1];
+        shape_table_uninit(table, num_gaps, 0);
+        return;
     };
 
-    let num_gaps = helix.max_gaps + 1;
+    shape_table_uninit(table, num_gaps, scan_len);
+
     let hlen = helix.helix_len;
 
-    // Precompute per-column lookup: 24 profile values as f32.
-    let mut col_vals = vec![[0.0f32; 24]; hlen];
+    // Stage the helix profile into [code; 32] per-column arrays (32 to keep
+    // the stride a power of two for SIMD-friendly indexing). The first
+    // DINUC_CODES = 26 entries hold the actual rows; the rest are padding
+    // and are never read by the inner loop.
+    let n_codes = profile::DINUC_CODES;
+    let stride = 32usize;
+    let mut col_vals = vec![[0.0f32; 32]; hlen];
     for j in 0..hlen {
-        for code in 0..24 {
-            col_vals[j][code] = helix.profile[code][j] as f32;
+        for code in 0..n_codes {
+            col_vals[j][code] = helix.profile_f32[code * hlen + j];
+        }
+    }
+    let _ = stride;
+
+    // Pre-encode the entire scan window into helix-class codes (0..6, see
+    // `NT_HELIX_CLASS_LUT` in profile.rs). Without this, the inner loop calls
+    // nt_helix_code() per (s, j, k), which re-runs the LUT for every base —
+    // millions of redundant lookups for anything but tiny patterns.
+    //
+    // Window size: we only ever read seq[0 .. scan_len + helix.max_len - 1].
+    let needed = scan_len + helix.max_len - 1;
+    let mut codes = vec![6u8; needed];
+    for (i, c) in codes.iter_mut().enumerate() {
+        *c = profile::NT_HELIX_CLASS_LUT[seq[i] as usize];
+    }
+
+    // Flatten DINUC_LUT into a stride-7 byte array (7 helix classes) so the
+    // inner loop indexes it as a single contiguous array.
+    let mut dinuc_flat = [0u8; 49];
+    for c5 in 0..7 {
+        for c3 in 0..7 {
+            dinuc_flat[c5 * 7 + c3] = DINUC_LUT[c5][c3];
         }
     }
 
-    let mut table = vec![vec![0.0f32; scan_len]; num_gaps];
+    let chunks = scan_len / 8;
+    let remainder = scan_len % 8;
 
     for k in 0..num_gaps {
         let scores = &mut table[k];
-        // Zero the scores for this gap variant.
-        for v in scores.iter_mut() {
-            *v = 0.0;
-        }
 
-        // Column-major: for each profile column j, accumulate across positions.
-        for j in 0..hlen {
+        // j == 0: assignment pass (no zero-init pass needed).
+        {
+            let j = 0;
             let vals = &col_vals[j];
-            // For position s:
-            //   left_base = seq[s + j]
-            //   right_base = seq[s + helix.min_len - 1 + k - j]
-            // The right offset from s is: (helix.min_len - 1 + k - j)
             let right_offset = helix.min_len - 1 + k - j;
-
-            // Process positions in chunks for auto-vectorization.
-            let chunks = scan_len / 8;
-            let remainder = scan_len % 8;
-
             for chunk in 0..chunks {
                 let base = chunk * 8;
                 for i in 0..8 {
                     let s = base + i;
-                    let left_base = seq[s + j];
-                    let right_base = seq[s + right_offset];
-                    let code = nt_helix_code(left_base, right_base);
-                    scores[s] += vals[code];
+                    let c5 = codes[s + j] as usize;
+                    let c3 = codes[s + right_offset] as usize;
+                    let code = dinuc_flat[c5 * 7 + c3] as usize;
+                    scores[s] = vals[code];
                 }
             }
-
             let base = chunks * 8;
             for i in 0..remainder {
                 let s = base + i;
-                let left_base = seq[s + j];
-                let right_base = seq[s + right_offset];
-                let code = nt_helix_code(left_base, right_base);
+                let c5 = codes[s + j] as usize;
+                let c3 = codes[s + right_offset] as usize;
+                let code = dinuc_flat[c5 * 7 + c3] as usize;
+                scores[s] = vals[code];
+            }
+        }
+
+        // j == 1..hlen: accumulation pass.
+        for j in 1..hlen {
+            let vals = &col_vals[j];
+            let right_offset = helix.min_len - 1 + k - j;
+            for chunk in 0..chunks {
+                let base = chunk * 8;
+                for i in 0..8 {
+                    let s = base + i;
+                    let c5 = codes[s + j] as usize;
+                    let c3 = codes[s + right_offset] as usize;
+                    let code = dinuc_flat[c5 * 7 + c3] as usize;
+                    scores[s] += vals[code];
+                }
+            }
+            let base = chunks * 8;
+            for i in 0..remainder {
+                let s = base + i;
+                let c5 = codes[s + j] as usize;
+                let c3 = codes[s + right_offset] as usize;
+                let code = dinuc_flat[c5 * 7 + c3] as usize;
                 scores[s] += vals[code];
             }
         }
     }
-
-    table
 }
 
 /// Compute score table for a gapped strand using multi-position DP.
@@ -145,29 +252,38 @@ pub fn compute_helix_score_table(seq: &[u8], helix: &Helix) -> Vec<Vec<f32>> {
 /// Runs W independent DP instances in parallel across scan positions.
 /// Each "lane" processes a different scan position through the same DP structure.
 pub fn compute_strand_score_table_gapped(seq: &[u8], strand: &Strand) -> Vec<Vec<f32>> {
+    let mut table = Vec::new();
+    compute_strand_score_table_gapped_into(seq, strand, &mut table);
+    table
+}
+
+/// Same as [`compute_strand_score_table_gapped`] but writes into an existing
+/// `Vec<Vec<f32>>` so callers can pool the per-gap-variant buffers.
+pub fn compute_strand_score_table_gapped_into(
+    seq: &[u8],
+    strand: &Strand,
+    table: &mut Vec<Vec<f32>>,
+) {
     let max_len = strand.max_len;
     let max_gaps = strand.max_gaps;
     let min_len = strand.min_len;
+    let num_gaps = max_gaps + 1;
     let scan_len = if seq.len() >= max_len {
         seq.len() - max_len + 1
     } else {
-        return vec![vec![]; max_gaps + 1];
+        shape_table_uninit(table, num_gaps, 0);
+        return;
     };
 
-    let num_gaps = max_gaps + 1;
-    let mut table = vec![vec![0.0f32; scan_len]; num_gaps];
+    shape_table_uninit(table, num_gaps, scan_len);
 
     let prof_len = max_len;
     let seq_len = max_len;
     let dp_cols = prof_len + 1;
 
-    // Precompute flat f32 profile for the DP.
-    let mut flat_profile = vec![0.0f32; 6 * prof_len];
-    for code in 0..6 {
-        for j in 0..prof_len {
-            flat_profile[code * prof_len + j] = strand.profile[code][j] as f32;
-        }
-    }
+    // Reuse the precomputed flat f32 profile that lives on the Strand.
+    // Layout: `profile_f32[code * max_len + j]`, length 6 * max_len.
+    let flat_profile: &[f32] = &strand.profile_f32;
     let gap_profile = &flat_profile[4 * prof_len..5 * prof_len];
 
     // Process W positions at a time.
@@ -220,8 +336,6 @@ pub fn compute_strand_score_table_gapped(seq: &[u8], strand: &Strand) -> Vec<Vec
             }
         }
     }
-
-    table
 }
 
 /// Run W independent DP instances on consecutive scan positions.
@@ -244,18 +358,22 @@ fn multi_dp_w<const W: usize>(
     scores_buf: &mut [f32],
 ) {
     let num_gaps = max_gaps + 1;
-    // Interleaved layout: cell(i, j) for lane L is at [(i * dp_cols + j) * W + L]
-    let total_cells = (seq_len + 1) * dp_cols;
-
-    // Reset band entries for all lanes (interleaved).
-    // First, fill everything with NEG_INFINITY.
-    for idx in 0..total_cells * W {
-        dp_buf[idx] = f32::NEG_INFINITY;
-    }
+    // Interleaved layout: cell(i, j) for lane L is at [(i * dp_cols + j) * W + L].
+    //
+    // We deliberately *don't* zero the full dp_buf here. The band cells written
+    // below are (0, 0..=max_gaps), the diagonal (i, i) for i in 1..=seq_len,
+    // and the band (i, j) with j in (i+1)..=min(i+max_gaps, prof_len). Every
+    // cell that the inner loop reads is within that envelope and is written
+    // before it is read (band writes proceed row-major; reads only touch
+    // (i-1, j-1) and (i, j-1), both of which sit inside the previously-written
+    // band). The score extraction at the end reads (seq_consumed, prof_len)
+    // which is the band's upper edge — always written. So leaving stale values
+    // outside the band is safe across W-position chunks. This drops one
+    // (seq_len+1) * (prof_len+1) * W f32 fill per chunk.
 
     // align[0][0] = 0 for all lanes.
     for lane in 0..W {
-        dp_buf[0 * W + lane] = 0.0;
+        dp_buf[lane] = 0.0;
     }
 
     // First row: gaps in sequence (same for all lanes since profile is shared).

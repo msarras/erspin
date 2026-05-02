@@ -86,8 +86,15 @@ pub struct Helix {
     pub db_begin_3p: usize,
     /// Position of 5' strand start within the pattern (at min gap config).
     pub min_bgn: usize,
-    /// Log-odds scoring profile: [dinuc_code][position], 24 × helix_len.
+    /// Log-odds scoring profile: [dinuc_code][position], `DINUC_CODES` × helix_len.
     pub profile: Vec<Vec<f64>>,
+    /// f32 flat-strided copy of `profile` for SIMD scoring.
+    /// Layout: `profile_f32[code * helix_len + j]`, length = `DINUC_CODES` * helix_len.
+    pub profile_f32: Vec<f32>,
+    /// Per-column-max sum: an upper bound on the score this helix can ever
+    /// contribute. Used by the DMP scorer for early-termination pruning. Stable
+    /// once `profile` is built, so cache it instead of recomputing per hit.
+    pub upper_bound: f64,
 }
 
 /// A single-stranded region (possibly with gaps).
@@ -104,6 +111,12 @@ pub struct Strand {
     pub min_bgn: usize,
     /// Log-odds scoring profile: [nt_code][position], 6 × max_len.
     pub profile: Vec<Vec<f64>>,
+    /// f32 flat-strided copy of `profile` for SIMD scoring.
+    /// Layout: `profile_f32[code * max_len + j]`, length = 6 * max_len.
+    pub profile_f32: Vec<f32>,
+    /// Per-column-max sum: upper bound on this strand's contribution. Same
+    /// purpose as `Helix::upper_bound`.
+    pub upper_bound: f64,
 }
 
 /// A pattern defines the secondary structure layout extracted from the
@@ -134,11 +147,30 @@ pub struct Config {
     pub hx_bgn: Vec<usize>,
     /// Gap variant for each mask helix (distance variation).
     pub hx_gaps: Vec<usize>,
-    /// Per-atom gap assignments (indexed by atom index in pattern).
-    pub atom_gaps: Vec<usize>,
+    /// Per-atom gap assignments (indexed by atom index in pattern). Shared via
+    /// `Arc` so every Hit produced from this config can refcount-bump instead
+    /// of cloning the Vec.
+    pub atom_gaps: std::sync::Arc<[usize]>,
 }
 
-/// A resolved mask with element indices and precomputed configurations.
+/// A gap variable: one degree of freedom in the gap configuration. Either a
+/// single mask-strand atom (a per-atom gap variable) or a cumulative span of
+/// non-mask atoms in the envelope. Cached on `ResolvedMask` so the DMP path
+/// can skip re-walking `in_mask` per hit.
+#[derive(Debug, Clone)]
+pub struct GapVar {
+    pub max_gaps: usize,
+    /// Atom index range (inclusive start, exclusive end).
+    pub atom_range: (usize, usize),
+    /// `true` if this variable maps 1:1 to a mask-strand atom (the gap goes
+    /// directly to that atom). `false` for non-mask cumulative groups.
+    pub is_mask_strand: bool,
+}
+
+/// A resolved mask with element indices, precomputed configurations, and
+/// derived per-mask scratch (envelope, inverse element maps, gap variables)
+/// that is shared between the SMP and DMP paths to avoid recomputing it per
+/// hit.
 #[derive(Debug, Clone)]
 pub struct ResolvedMask {
     /// Indices into pattern.helices.
@@ -157,6 +189,24 @@ pub struct ResolvedMask {
     pub min_len: usize,
     /// Maximum total length covered.
     pub max_len: usize,
+    /// Per-atom membership: `in_mask[atom_idx] == true` iff the atom is part
+    /// of this mask. Length = pattern.atoms.len().
+    pub in_mask: Vec<bool>,
+    /// Inclusive first atom index covered by the mask envelope. `0` if the
+    /// mask is empty.
+    pub first_atom: usize,
+    /// Inclusive last atom index covered by the mask envelope. `0` if empty.
+    pub last_atom: usize,
+    /// Inverse helix-index map: `hx_inv[pattern_helix_idx] = Some(mask_pos)`
+    /// if the helix is in this mask, else `None`. Length = pattern.helices.len().
+    pub hx_inv: Vec<Option<usize>>,
+    /// Inverse strand-index map: `st_inv[pattern_strand_idx] = Some(mask_pos)`
+    /// if the strand is in this mask, else `None`. Length = pattern.strands.len().
+    pub st_inv: Vec<Option<usize>>,
+    /// Gap variables for this mask, derived from pattern + (hx_indices, st_indices).
+    /// Stable across the mask's lifetime; reused by both `generate_configs`
+    /// and the per-hit DMP `generate_configs_constrained`.
+    pub gap_vars: Vec<GapVar>,
 }
 
 /// A parsed training set.
@@ -186,22 +236,34 @@ pub struct Sequence {
 
 impl Sequence {
     pub fn reverse_complement(&self) -> Vec<u8> {
-        self.data
-            .iter()
-            .rev()
-            .map(|&b| match b {
-                b'A' => b'T',
-                b'T' => b'A',
-                b'G' => b'C',
-                b'C' => b'G',
-                other => other,
-            })
-            .collect()
+        let mut out = Vec::with_capacity(self.data.len());
+        write_reverse_complement(&self.data, &mut out);
+        out
+    }
+
+    /// Write the reverse-complement of `self.data` into `out` (clearing first),
+    /// reusing existing capacity. Used by the search path so the RC buffer can
+    /// be pooled across sequences in a thread.
+    pub fn reverse_complement_into(&self, out: &mut Vec<u8>) {
+        out.clear();
+        out.reserve(self.data.len());
+        write_reverse_complement(&self.data, out);
     }
 
     pub fn len(&self) -> usize {
         self.data.len()
     }
+}
+
+#[inline]
+fn write_reverse_complement(data: &[u8], out: &mut Vec<u8>) {
+    out.extend(data.iter().rev().map(|&b| match b {
+        b'A' => b'T',
+        b'T' => b'A',
+        b'G' => b'C',
+        b'C' => b'G',
+        other => other,
+    }));
 }
 
 /// Region specification.
@@ -278,8 +340,11 @@ pub struct Hit {
     pub evalue: Option<f64>,
     /// Direction: forward or reverse complement.
     pub direction: StrandDirection,
-    /// Gap configuration index.
+    /// Gap configuration index — refers to the configs of the level that
+    /// produced this hit.
     pub config_index: usize,
     /// Per-atom gap assignments from the winning config (for DMP propagation).
-    pub atom_gaps: Vec<usize>,
+    /// Shared via `Arc` so producing a Hit from a precomputed config is just a
+    /// refcount bump rather than a Vec clone.
+    pub atom_gaps: std::sync::Arc<[usize]>,
 }

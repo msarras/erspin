@@ -43,45 +43,105 @@ pub fn compute_mask_score_tables(
     pattern: &Pattern,
     mask: &ResolvedMask,
 ) -> ScoreTables {
-    let helix_scores: Vec<_> = mask
-        .hx_indices
-        .iter()
-        .map(|&idx| compute_helix_score_table(seq, &pattern.helices[idx]))
-        .collect();
+    let mut tables = ScoreTables {
+        helix_scores: Vec::new(),
+        strand_scores: Vec::new(),
+    };
+    compute_mask_score_tables_into(seq, pattern, mask, &mut tables);
+    tables
+}
 
-    let strand_scores: Vec<_> = mask
-        .st_indices
-        .iter()
-        .map(|&idx| compute_strand_score_table(seq, &pattern.strands[idx]))
-        .collect();
+/// Same as [`compute_mask_score_tables`] but reuses an existing `ScoreTables`
+/// so the `Vec<f32>` per-element/per-gap-variant buffers stay hot across
+/// many calls. Pair with `thread_local!` scratch storage for big wins on
+/// parallel multi-sequence searches.
+pub fn compute_mask_score_tables_into(
+    seq: &[u8],
+    pattern: &Pattern,
+    mask: &ResolvedMask,
+    tables: &mut ScoreTables,
+) {
+    let nh = mask.hx_indices.len();
+    let ns = mask.st_indices.len();
+    tables.helix_scores.truncate(nh);
+    while tables.helix_scores.len() < nh {
+        tables.helix_scores.push(Vec::new());
+    }
+    tables.strand_scores.truncate(ns);
+    while tables.strand_scores.len() < ns {
+        tables.strand_scores.push(Vec::new());
+    }
 
-    ScoreTables {
-        helix_scores,
-        strand_scores,
+    for (i, &idx) in mask.hx_indices.iter().enumerate() {
+        simd::compute_helix_score_table_into(
+            seq,
+            &pattern.helices[idx],
+            &mut tables.helix_scores[i],
+        );
+    }
+
+    for (i, &idx) in mask.st_indices.iter().enumerate() {
+        let strand = &pattern.strands[idx];
+        let dst = &mut tables.strand_scores[i];
+        if strand.max_gaps == 0 {
+            // No-gap strands have a single gap variant; reuse the inner Vec<f32>.
+            dst.truncate(1);
+            while dst.len() < 1 {
+                dst.push(Vec::new());
+            }
+            simd::compute_strand_score_table_nogap_into(seq, strand, &mut dst[0]);
+            if dst[0].is_empty() {
+                // Sequence was shorter than the strand: keep an empty vec to
+                // mirror the legacy `vec![vec![]; 1]` behaviour.
+            }
+        } else {
+            simd::compute_strand_score_table_gapped_into(seq, strand, dst);
+        }
     }
 }
 
-/// A precomputed lookup entry for fast config scoring.
-/// Each entry holds a slice reference and an offset, avoiding repeated
-/// bounds checking and Vec indirection in the hot loop.
+/// A precomputed lookup entry for fast config scoring. Each "entry" is a
+/// raw `*const f32` pointing into one of the score tables, already offset by
+/// the config's per-element `bgn`, so the inner loop is a single pointer
+/// add + load. The slice length is folded into `max_safe_tab` so we don't
+/// carry it through the hot path.
+///
+/// SAFETY: pointers reference data inside `ScoreTables` (the `'a` lifetime
+/// parameter); the lookup must not outlive the tables it was built from.
 pub struct ConfigLookup<'a> {
-    /// For each config: a flat array of (score_slice, bgn_offset) pairs.
-    /// First strands, then helices. All configs have the same number of entries.
-    entries: Vec<Vec<(&'a [f32], usize)>>,
+    /// Flat array of pointers, length `n_configs * n_elements`. Layout:
+    /// `entries[cfg_idx * n_elements + ei]`. Empty / invalid configs have
+    /// their stride filled with null but `max_safe_tab[cfg_idx] == 0`, so
+    /// the inner loop never dereferences them.
+    entries: Vec<*const f32>,
+    /// Number of elements per config (mask.st_indices.len() + mask.hx_indices.len()).
+    n_elements: usize,
     /// Config lengths.
     config_lens: Vec<usize>,
     /// Suffix max scores: suffix_max[i] = max score achievable from elements i..n.
-    /// Used for early termination. Computed per-element as the global max over
-    /// all gap variants and positions.
+    /// Used for early termination.
     suffix_max: Vec<f64>,
+    /// Per-config: smallest `tab_index` value at which any element falls off
+    /// the end of its score slice. Equivalently, `min over ei of (slice.len()
+    /// - bgn)`. The inner loop checks `tab_index < max_safe_tab[cfg]` once
+    /// and then dereferences without bounds checks.
+    max_safe_tab: Vec<usize>,
+    /// Anchor lifetime to the tables we built from.
+    _phantom: std::marker::PhantomData<&'a ()>,
 }
+
+// SAFETY: ConfigLookup contains raw pointers to data owned elsewhere. As
+// long as the lifetime contract is upheld (`tables` outlives the lookup),
+// it's safe to share across threads — the pointed-to data is read-only.
+unsafe impl<'a> Send for ConfigLookup<'a> {}
+unsafe impl<'a> Sync for ConfigLookup<'a> {}
 
 impl<'a> ConfigLookup<'a> {
     /// Build a precomputed config lookup from mask and score tables.
     pub fn build(mask: &ResolvedMask, tables: &'a ScoreTables) -> Self {
         let n_elements = mask.st_indices.len() + mask.hx_indices.len();
-        let mut entries = Vec::with_capacity(mask.configs.len());
-        let mut config_lens = Vec::with_capacity(mask.configs.len());
+        let n_configs = mask.configs.len();
+        let mut config_lens = Vec::with_capacity(n_configs);
 
         // Compute per-element global max score (for early termination bound).
         let mut element_max = vec![f32::NEG_INFINITY; n_elements];
@@ -107,46 +167,79 @@ impl<'a> ConfigLookup<'a> {
             suffix_max[i] = suffix_max[i + 1] + element_max[i] as f64;
         }
 
-        for cfg in &mask.configs {
-            let mut cfg_entries = Vec::with_capacity(n_elements);
-            let mut valid = true;
+        // Flat entries array: stride n_elements per config.
+        let mut entries: Vec<*const f32> = vec![std::ptr::null(); n_configs * n_elements];
+        let mut max_safe_tab: Vec<usize> = vec![0; n_configs];
 
-            for s in 0..mask.st_indices.len() {
+        let nst = mask.st_indices.len();
+        let nhx = mask.hx_indices.len();
+
+        for (cfg_idx, cfg) in mask.configs.iter().enumerate() {
+            let row = cfg_idx * n_elements;
+            let mut valid = true;
+            let mut safe = usize::MAX;
+
+            for s in 0..nst {
                 let gap = cfg.st_gaps[s];
-                if gap < tables.strand_scores[s].len() {
-                    cfg_entries.push((
-                        tables.strand_scores[s][gap].as_slice(),
-                        cfg.st_bgn[s],
-                    ));
-                } else {
+                if gap >= tables.strand_scores[s].len() {
                     valid = false;
                     break;
+                }
+                let slice = tables.strand_scores[s][gap].as_slice();
+                let bgn = cfg.st_bgn[s];
+                if bgn > slice.len() {
+                    valid = false;
+                    break;
+                }
+                // SAFETY: bgn ≤ slice.len(); the resulting pointer points one
+                // past the slice's last element at worst, which is allowed.
+                entries[row + s] = unsafe { slice.as_ptr().add(bgn) };
+                let safe_for_e = slice.len() - bgn;
+                if safe_for_e < safe {
+                    safe = safe_for_e;
                 }
             }
 
             if valid {
-                for h in 0..mask.hx_indices.len() {
+                for h in 0..nhx {
                     let gap = cfg.hx_gaps[h];
-                    if gap < tables.helix_scores[h].len() {
-                        cfg_entries.push((
-                            tables.helix_scores[h][gap].as_slice(),
-                            cfg.hx_bgn[h],
-                        ));
-                    } else {
+                    if gap >= tables.helix_scores[h].len() {
                         valid = false;
                         break;
+                    }
+                    let slice = tables.helix_scores[h][gap].as_slice();
+                    let bgn = cfg.hx_bgn[h];
+                    if bgn > slice.len() {
+                        valid = false;
+                        break;
+                    }
+                    entries[row + nst + h] = unsafe { slice.as_ptr().add(bgn) };
+                    let safe_for_e = slice.len() - bgn;
+                    if safe_for_e < safe {
+                        safe = safe_for_e;
                     }
                 }
             }
 
-            if !valid {
-                cfg_entries.clear();
+            // Invalid configs end up with safe=0 (or original usize::MAX if
+            // n_elements==0). In either case the inner loop's `tab_index >=
+            // safe` check skips them.
+            if !valid || n_elements == 0 {
+                max_safe_tab[cfg_idx] = 0;
+            } else {
+                max_safe_tab[cfg_idx] = safe;
             }
-            entries.push(cfg_entries);
             config_lens.push(cfg.len);
         }
 
-        Self { entries, config_lens, suffix_max }
+        Self {
+            entries,
+            n_elements,
+            config_lens,
+            suffix_max,
+            max_safe_tab,
+            _phantom: std::marker::PhantomData,
+        }
     }
 
     /// Find the best-scoring configuration at a given position.
@@ -154,31 +247,32 @@ impl<'a> ConfigLookup<'a> {
     pub fn best_score(&self, tab_index: usize) -> (f64, usize) {
         let mut best_score = f64::NEG_INFINITY;
         let mut best_idx = 0;
+        let n_elements = self.n_elements;
 
-        for (cfg_idx, cfg_entries) in self.entries.iter().enumerate() {
-            if cfg_entries.is_empty() {
+        for cfg_idx in 0..self.config_lens.len() {
+            // Per-config bounds check (replaces the per-element `pos <
+            // slice.len()` test in the inner loop). Invalid configs have
+            // max_safe_tab=0 and are filtered here.
+            if tab_index >= unsafe { *self.max_safe_tab.get_unchecked(cfg_idx) } {
                 continue;
             }
+            let row = cfg_idx * n_elements;
             let mut score = 0.0f64;
-            let mut valid = true;
+            let mut early_exit = false;
 
-            for (ei, &(slice, bgn)) in cfg_entries.iter().enumerate() {
-                let pos = tab_index + bgn;
-                if pos < slice.len() {
-                    score += unsafe { *slice.get_unchecked(pos) } as f64;
-                    // Early termination: if partial score + max possible remaining
-                    // can't beat the current best, skip this config.
-                    if score + self.suffix_max[ei + 1] <= best_score {
-                        valid = false;
-                        break;
-                    }
-                } else {
-                    valid = false;
+            for ei in 0..n_elements {
+                // SAFETY: tab_index < max_safe_tab[cfg_idx] ≤ slice.len() -
+                // bgn, so the offset pointer stored at `entries[row + ei]`
+                // plus `tab_index` lands inside the slice.
+                let ptr = unsafe { *self.entries.get_unchecked(row + ei) };
+                score += unsafe { *ptr.add(tab_index) } as f64;
+                if score + unsafe { *self.suffix_max.get_unchecked(ei + 1) } <= best_score {
+                    early_exit = true;
                     break;
                 }
             }
 
-            if valid && score > best_score {
+            if !early_exit && score > best_score {
                 best_score = score;
                 best_idx = cfg_idx;
             }
@@ -193,31 +287,30 @@ impl<'a> ConfigLookup<'a> {
     pub fn best_score_threshold(&self, tab_index: usize, threshold: f64) -> (f64, usize) {
         let mut best_score = f64::NEG_INFINITY;
         let mut best_idx = 0;
+        let n_elements = self.n_elements;
 
-        for (cfg_idx, cfg_entries) in self.entries.iter().enumerate() {
-            if cfg_entries.is_empty() {
+        for cfg_idx in 0..self.config_lens.len() {
+            if tab_index >= unsafe { *self.max_safe_tab.get_unchecked(cfg_idx) } {
                 continue;
             }
+            let row = cfg_idx * n_elements;
             let mut score = 0.0f64;
-            let mut valid = true;
+            let mut early_exit = false;
+            // best_score only changes between configs, so the pruning target
+            // is invariant within the inner loop. Hoist the branch.
+            let min_target = if best_score > threshold { best_score } else { threshold };
 
-            for (ei, &(slice, bgn)) in cfg_entries.iter().enumerate() {
-                let pos = tab_index + bgn;
-                if pos < slice.len() {
-                    score += unsafe { *slice.get_unchecked(pos) } as f64;
-                    // Early termination: can't reach threshold OR current best.
-                    let min_target = if best_score > threshold { best_score } else { threshold };
-                    if score + self.suffix_max[ei + 1] <= min_target {
-                        valid = false;
-                        break;
-                    }
-                } else {
-                    valid = false;
+            for ei in 0..n_elements {
+                // SAFETY: see best_score above.
+                let ptr = unsafe { *self.entries.get_unchecked(row + ei) };
+                score += unsafe { *ptr.add(tab_index) } as f64;
+                if score + unsafe { *self.suffix_max.get_unchecked(ei + 1) } <= min_target {
+                    early_exit = true;
                     break;
                 }
             }
 
-            if valid && score > best_score {
+            if !early_exit && score > best_score {
                 best_score = score;
                 best_idx = cfg_idx;
             }
@@ -300,16 +393,65 @@ pub fn score_configs_direct(
     mask: &ResolvedMask,
     seq_pos: usize,
 ) -> (f64, usize) {
-    if mask.configs.is_empty() {
+    score_configs_direct_with(seq, pattern, mask, &mask.configs, seq_pos, mask.threshold)
+}
+
+/// Variant of `score_configs_direct` that accepts an external configs slice
+/// (used by the DMP path, which produces per-hit constrained configs without
+/// allocating a fresh `ResolvedMask`). `threshold` is the score floor used for
+/// pruning.
+pub fn score_configs_direct_with(
+    seq: &[u8],
+    pattern: &Pattern,
+    mask: &ResolvedMask,
+    configs: &[Config],
+    seq_pos: usize,
+    threshold: f64,
+) -> (f64, usize) {
+    if configs.is_empty() {
         return (f64::NEG_INFINITY, 0);
     }
 
-    let ref0 = &mask.configs[0];
+    // Single-config DMP fast path: every element is trivially fixed; one
+    // sweep covers it.
+    if configs.len() == 1 {
+        let cfg = &configs[0];
+        if seq_pos + cfg.len > seq.len() {
+            return (f64::NEG_INFINITY, 0);
+        }
+        let mut score = 0.0f64;
+        for (s, &st_idx) in mask.st_indices.iter().enumerate() {
+            let strand = &pattern.strands[st_idx];
+            let pos = seq_pos + cfg.st_bgn[s];
+            let len = strand.min_len + cfg.st_gaps[s];
+            if pos + len > seq.len() {
+                return (f64::NEG_INFINITY, 0);
+            }
+            score += score_strand_run(strand, &seq[pos..pos + len]);
+        }
+        for (h, &hx_idx) in mask.hx_indices.iter().enumerate() {
+            let helix = &pattern.helices[hx_idx];
+            let pos5 = seq_pos + cfg.hx_bgn[h];
+            let dist = helix.min_dist + cfg.hx_gaps[h];
+            let pos3 = pos5 + helix.helix_len + dist;
+            if pos3 + helix.helix_len > seq.len() {
+                return (f64::NEG_INFINITY, 0);
+            }
+            score += score_helix_run(
+                helix,
+                &seq[pos5..pos5 + helix.helix_len],
+                &seq[pos3..pos3 + helix.helix_len],
+            );
+        }
+        return (score, 0);
+    }
+
+    let ref0 = &configs[0];
 
     // Identify fixed strands: same (bgn, gaps) across all configs.
     let st_fixed: Vec<bool> = (0..mask.st_indices.len())
         .map(|s| {
-            mask.configs
+            configs
                 .iter()
                 .all(|c| c.st_bgn[s] == ref0.st_bgn[s] && c.st_gaps[s] == ref0.st_gaps[s])
         })
@@ -318,7 +460,7 @@ pub fn score_configs_direct(
     // Identify fixed helices: same (bgn, gaps) across all configs.
     let hx_fixed: Vec<bool> = (0..mask.hx_indices.len())
         .map(|h| {
-            mask.configs
+            configs
                 .iter()
                 .all(|c| c.hx_bgn[h] == ref0.hx_bgn[h] && c.hx_gaps[h] == ref0.hx_gaps[h])
         })
@@ -339,12 +481,7 @@ pub fn score_configs_direct(
             fixed_valid = false;
             break;
         }
-        let mut s_score = 0.0f64;
-        for j in 0..len {
-            let code = nt_strand_code(seq[pos + j]);
-            s_score += strand.profile[code][j] as f64;
-        }
-        fixed_score += s_score;
+        fixed_score += score_strand_run(strand, &seq[pos..pos + len]);
     }
 
     if fixed_valid {
@@ -360,14 +497,7 @@ pub fn score_configs_direct(
                 fixed_valid = false;
                 break;
             }
-            let mut h_score = 0.0f64;
-            for j in 0..helix.helix_len {
-                let b5 = seq[pos5 + j];
-                let b3 = seq[pos3 + helix.helix_len - 1 - j];
-                let code = nt_helix_code(b5, b3);
-                h_score += helix.profile[code][j] as f64;
-            }
-            fixed_score += h_score;
+            fixed_score += score_helix_run(helix, &seq[pos5..pos5 + helix.helix_len], &seq[pos3..pos3 + helix.helix_len]);
         }
     }
 
@@ -375,21 +505,64 @@ pub fn score_configs_direct(
         return (f64::NEG_INFINITY, 0);
     }
 
+    // Per-variable-element upper bounds: precomputed on Strand/Helix at
+    // pattern build (sum of per-column max profile value). Used for early
+    // termination on the same model as `ConfigLookup`'s suffix_max.
+    let st_upper: Vec<f64> = mask
+        .st_indices
+        .iter()
+        .enumerate()
+        .map(|(s, &idx)| if st_fixed[s] { 0.0 } else { pattern.strands[idx].upper_bound })
+        .collect();
+    let hx_upper: Vec<f64> = mask
+        .hx_indices
+        .iter()
+        .enumerate()
+        .map(|(h, &idx)| if hx_fixed[h] { 0.0 } else { pattern.helices[idx].upper_bound })
+        .collect();
+
+    // suffix_max ordered as: [strand vars in iter order] then [helix vars in iter order].
+    // suffix_max[i] = sum of upper bounds for ALL variable elements at positions ≥ i,
+    // both remaining strands and all helices when i < nst, and remaining helices
+    // when i >= nst. Building this as a single backward sweep over the
+    // concatenated upper-bound array ensures the strand-loop prune check
+    // accounts for the helix contribution that comes later — without that,
+    // valid configs where the helices carry most of the score get pruned.
+    let nst = mask.st_indices.len();
+    let nhx = mask.hx_indices.len();
+    let mut suffix_max = vec![0.0f64; nst + nhx + 1];
+    for h in (0..nhx).rev() {
+        suffix_max[nst + h] = suffix_max[nst + h + 1] + hx_upper[h];
+    }
+    for s in (0..nst).rev() {
+        suffix_max[s] = suffix_max[s + 1] + st_upper[s];
+    }
+
     // Score variable elements per-config.
     let mut best_score = f64::NEG_INFINITY;
     let mut best_idx = 0;
 
-    for (cfg_idx, cfg) in mask.configs.iter().enumerate() {
+    for (cfg_idx, cfg) in configs.iter().enumerate() {
         if seq_pos + cfg.len > seq.len() {
             continue;
         }
 
         let mut score = fixed_score;
         let mut valid = true;
+        // Pruning target: a config must beat both the existing best and the
+        // mask threshold to be a useful hit.
+        let target = best_score.max(threshold);
 
+        // Strand variables first (their order matches suffix_max indices 0..nst).
         for (s, &st_idx) in mask.st_indices.iter().enumerate() {
             if st_fixed[s] {
                 continue;
+            }
+            // Partial + every remaining var's upper bound — if this can't
+            // exceed target there's no way this config wins. Skip the rest.
+            if score + suffix_max[s] <= target {
+                valid = false;
+                break;
             }
             let strand = &pattern.strands[st_idx];
             let pos = seq_pos + cfg.st_bgn[s];
@@ -398,18 +571,17 @@ pub fn score_configs_direct(
                 valid = false;
                 break;
             }
-            let mut s_score = 0.0f64;
-            for j in 0..len {
-                let code = nt_strand_code(seq[pos + j]);
-                s_score += strand.profile[code][j] as f64;
-            }
-            score += s_score;
+            score += score_strand_run(strand, &seq[pos..pos + len]);
         }
 
         if valid {
             for (h, &hx_idx) in mask.hx_indices.iter().enumerate() {
                 if hx_fixed[h] {
                     continue;
+                }
+                if score + suffix_max[nst + h] <= target {
+                    valid = false;
+                    break;
                 }
                 let helix = &pattern.helices[hx_idx];
                 let pos5 = seq_pos + cfg.hx_bgn[h];
@@ -419,14 +591,11 @@ pub fn score_configs_direct(
                     valid = false;
                     break;
                 }
-                let mut h_score = 0.0f64;
-                for j in 0..helix.helix_len {
-                    let b5 = seq[pos5 + j];
-                    let b3 = seq[pos3 + helix.helix_len - 1 - j];
-                    let code = nt_helix_code(b5, b3);
-                    h_score += helix.profile[code][j] as f64;
-                }
-                score += h_score;
+                score += score_helix_run(
+                    helix,
+                    &seq[pos5..pos5 + helix.helix_len],
+                    &seq[pos3..pos3 + helix.helix_len],
+                );
             }
         }
 
@@ -439,36 +608,142 @@ pub fn score_configs_direct(
     (best_score, best_idx)
 }
 
-/// Score a single training set sequence against a mask.
-/// Used for threshold computation.
+/// Score a contiguous run of `seq.len()` bases against the leading columns
+/// of `strand.profile_f32`. For ungapped strands (`min_len == max_len`),
+/// this is a straight sum over the diagonal (one profile column per base).
+/// For gapped strands (`max_gaps > 0`), the alignment is found via a banded
+/// DP that mirrors C ERPIN's `AlignSProfile` (libsrc/align.c): the DP
+/// returns `Align[seq.len()][max_len]` — the best score aligning `seq.len()`
+/// query bases to all `max_len` profile columns, with `max_len - seq.len()`
+/// gap insertions distributed optimally. The straight diagonal sum is
+/// suboptimal in general; using it for gapped strands underscores the
+/// alignment by ~20 points on real intron sequences and was responsible
+/// for missing C parity hits on the IB intron test case.
+#[inline]
+fn score_strand_run(strand: &Strand, seq: &[u8]) -> f64 {
+    if strand.max_gaps == 0 {
+        return score_strand_run_linear(strand, seq);
+    }
+    score_strand_run_dp(strand, seq)
+}
+
+#[inline]
+fn score_strand_run_linear(strand: &Strand, seq: &[u8]) -> f64 {
+    let cols = strand.max_len;
+    let prof = strand.profile_f32.as_slice();
+    let mut acc = 0.0f64;
+    for (j, &b) in seq.iter().enumerate() {
+        let code = nt_strand_code(b);
+        // SAFETY: `code < 6` (per `nt_strand_code` LUT) and `j < seq.len() <=
+        // strand.max_len = cols`, so `code * cols + j < 6 * cols == prof.len()`.
+        acc += unsafe { *prof.get_unchecked(code * cols + j) } as f64;
+    }
+    acc
+}
+
+/// Banded gapped-strand DP. Mirrors C ERPIN's `AlignSProfile` (libsrc/align.c).
+/// Returns the score for aligning `seq.len()` query bases to `strand.max_len`
+/// profile columns, with `max_len - seq.len()` insertions (= gap row, code 4
+/// in the profile) distributed optimally along the alignment.
+///
+/// Required: `min_len <= seq.len() <= max_len`.
+#[inline]
+fn score_strand_run_dp(strand: &Strand, seq: &[u8]) -> f64 {
+    let m = seq.len();
+    let n = strand.max_len;
+    let max_gaps = strand.max_gaps;
+    let prof = strand.profile_f32.as_slice();
+
+    // Pre-encode query bases.
+    let codes: Vec<usize> = (0..m).map(|i| nt_strand_code(seq[i])).collect();
+
+    // align[i][j]: best score aligning first i query bases to first j profile
+    // cols. Band constraint: 0 <= j - i <= max_gaps. Out-of-band cells stay
+    // NEG_INFINITY and are never read by the in-band recurrence.
+    let stride = n + 1;
+    let mut align = vec![f64::NEG_INFINITY; (m + 1) * stride];
+    align[0] = 0.0;
+
+    // Row 0 (pure-insertion path): align[0][j] = align[0][j-1] + prof[gap_row, j-1].
+    // Profile row 4 = gap row in Rust's strand layout (NT_STRAND_LUT).
+    let prof_x_offset = 4 * n;
+    for j in 1..=max_gaps.min(n) {
+        align[j] = align[j - 1] + prof[prof_x_offset + j - 1] as f64;
+    }
+
+    // Diagonal: align[j][j] = align[j-1][j-1] + prof[code(seq[j-1]), j-1].
+    let limit_diag = m.min(n);
+    for j in 1..=limit_diag {
+        let code = codes[j - 1];
+        let v = prof[code * n + j - 1] as f64;
+        align[j * stride + j] = align[(j - 1) * stride + (j - 1)] + v;
+    }
+
+    // In-band fill: for i in 1..=m, j in (i+1)..=min(n, i+max_gaps).
+    for i in 1..=m {
+        let jmax = (i + max_gaps).min(n);
+        for j in (i + 1)..=jmax {
+            let jm1 = j - 1;
+            let code = codes[i - 1];
+            let match_score = align[(i - 1) * stride + jm1] + prof[code * n + jm1] as f64;
+            let gap_score = align[i * stride + jm1] + prof[prof_x_offset + jm1] as f64;
+            align[i * stride + j] = match_score.max(gap_score);
+        }
+    }
+
+    align[m * stride + n]
+}
+
+/// Score a helix's two strands of length `helix.helix_len` each. The 3'
+/// strand is read in reverse (Watson-Crick pairing reads the complement of
+/// the 3' nucleotide farthest from the 5' position).
+#[inline]
+fn score_helix_run(helix: &Helix, seq5: &[u8], seq3: &[u8]) -> f64 {
+    let cols = helix.helix_len;
+    debug_assert_eq!(seq5.len(), cols);
+    debug_assert_eq!(seq3.len(), cols);
+    let prof = helix.profile_f32.as_slice();
+    let mut acc = 0.0f64;
+    for j in 0..cols {
+        let code = nt_helix_code(seq5[j], seq3[cols - 1 - j]);
+        // SAFETY: `code < DINUC_CODES (= 26)` so `code * cols + j < 26 * cols
+        // == prof.len()`.
+        acc += unsafe { *prof.get_unchecked(code * cols + j) } as f64;
+    }
+    acc
+}
+
+/// Score a single training set sequence against a mask. Used for threshold
+/// computation (one-time per mask × training-sequence at search startup).
 pub fn score_training_sequence(
     seq: &[u8],
     pattern: &Pattern,
     mask: &ResolvedMask,
 ) -> f64 {
-    // The training sequence is aligned, so we score at position 0 with specific column mapping.
-    // For each element, extract the non-gap bases and score them.
     let mut total_score = 0.0;
 
-    for (_s, &st_idx) in mask.st_indices.iter().enumerate() {
+    for &st_idx in &mask.st_indices {
         let strand = &pattern.strands[st_idx];
-        let mut score = 0.0;
-        for j in 0..strand.max_len {
-            let col = strand.db_begin + j;
-            let code = nt_strand_code(seq[col]);
-            score += strand.profile[code][j];
+        let cols = strand.max_len;
+        let prof = strand.profile_f32.as_slice();
+        let mut score = 0.0f64;
+        for j in 0..cols {
+            let code = nt_strand_code(seq[strand.db_begin + j]);
+            score += prof[code * cols + j] as f64;
         }
         total_score += score;
     }
 
-    for (_h, &hx_idx) in mask.hx_indices.iter().enumerate() {
+    for &hx_idx in &mask.hx_indices {
         let helix = &pattern.helices[hx_idx];
-        let mut score = 0.0;
-        for j in 0..helix.helix_len {
+        let cols = helix.helix_len;
+        let prof = helix.profile_f32.as_slice();
+        let mut score = 0.0f64;
+        for j in 0..cols {
             let col5 = helix.db_begin_5p + j;
-            let col3 = helix.db_begin_3p + helix.helix_len - 1 - j;
+            let col3 = helix.db_begin_3p + cols - 1 - j;
             let code = nt_helix_code(seq[col5], seq[col3]);
-            score += helix.profile[code][j];
+            score += prof[code * cols + j] as f64;
         }
         total_score += score;
     }

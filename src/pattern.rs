@@ -1,6 +1,65 @@
 use crate::profile::{self, Background};
 use crate::types::*;
 
+/// Maximum partial sum of per-column maxima over valid lengths
+/// `[min_cols, max_cols]`. Serves as an upper bound on the score this element
+/// can ever contribute across all configs, used by DMP early termination.
+///
+/// For elements with a fixed scoring length (`min_cols == max_cols`), this is
+/// just the full sum. For length-variable strands (`min_cols < max_cols`), the
+/// trailing columns can have NEGATIVE per-column maxima (sparsely-observed
+/// alignment positions), so the full sum can be LESS than the sum over the
+/// first `min_cols` columns. Returning the maximum partial sum keeps the
+/// bound a true upper bound — the previous "always sum to max_cols" version
+/// could underestimate, causing valid configs to be wrongly pruned in
+/// `score_configs_direct`.
+fn column_max_sum(profile: &[Vec<f64>], min_cols: usize, max_cols: usize) -> f64 {
+    let mut running = 0.0f64;
+    let mut best = f64::NEG_INFINITY;
+    for j in 0..max_cols {
+        let mut col_max = f64::NEG_INFINITY;
+        for row in profile.iter() {
+            if j >= row.len() {
+                continue;
+            }
+            let v = row[j];
+            if v > col_max {
+                col_max = v;
+            }
+        }
+        if col_max.is_finite() {
+            running += col_max;
+        }
+        if j + 1 >= min_cols && running > best {
+            best = running;
+        }
+    }
+    if best.is_finite() { best } else { 0.0 }
+}
+
+/// Flatten a `[code][position]` log-odds profile to a flat `f32` buffer
+/// laid out as `flat[code * cols + j]`. Skips trailing rows whose lengths
+/// don't match `cols`, so this works for both the 6×L strand and 24×L helix
+/// shapes. The result is what the SIMD scoring routines consume.
+fn flatten_profile_f32(profile: &[Vec<f64>], cols: usize) -> Vec<f32> {
+    let codes = profile.len();
+    let mut flat = vec![0.0f32; codes * cols];
+    for (code, row) in profile.iter().enumerate() {
+        debug_assert_eq!(
+            row.len(),
+            cols,
+            "profile row {} has length {}, expected {}",
+            code,
+            row.len(),
+            cols
+        );
+        for (j, &v) in row.iter().enumerate() {
+            flat[code * cols + j] = v as f32;
+        }
+    }
+    flat
+}
+
 /// Build a Pattern from a training set and region specification.
 ///
 /// The pattern contains all structural elements (helices and strands) within
@@ -64,6 +123,11 @@ pub fn build_pattern(
 
             let hx_idx = helices.len();
             helix_map.insert(code, hx_idx);
+            let profile_f32 = flatten_profile_f32(&profile, helix_len);
+            // Helices score over a fixed `helix_len` columns regardless of
+            // gap configuration (the gap is *between* the two strands, not
+            // within them), so min == max here.
+            let upper_bound = column_max_sum(&profile, helix_len, helix_len);
             helices.push(Helix {
                 id: code,
                 helix_len,
@@ -76,6 +140,8 @@ pub fn build_pattern(
                 db_begin_3p: run3.start_col,
                 min_bgn: 0, // set below
                 profile,
+                profile_f32,
+                upper_bound,
             });
         } else if runs_for_code.len() == 1 {
             let run = runs_for_code[0];
@@ -86,6 +152,13 @@ pub fn build_pattern(
 
             let st_idx = strands.len();
             strand_map.insert(code, st_idx);
+            let profile_f32 = flatten_profile_f32(&profile, run.num_cols);
+            // Strands score over `min_len + gap` columns, with gap in
+            // `[0, max_gaps]`. The trailing columns can have negative max
+            // values, so the true upper bound is the max prefix sum over
+            // valid lengths, not the full sum to `num_cols`.
+            let strand_min_len = run.num_cols - max_gaps;
+            let upper_bound = column_max_sum(&profile, strand_min_len, run.num_cols);
             strands.push(Strand {
                 id: code,
                 min_len: run.num_cols - max_gaps,
@@ -94,6 +167,8 @@ pub fn build_pattern(
                 db_begin: run.start_col,
                 min_bgn: 0, // set below
                 profile,
+                profile_f32,
+                upper_bound,
             });
         }
     }
@@ -264,23 +339,22 @@ fn compute_inter_helix_gaps(ts: &TrainingSet, run5: &Run, run3: &Run, all_runs: 
     total_gaps
 }
 
-/// Count the number of variable gap columns in a strand run.
-/// A column is a "gap column" if at least one training sequence has a gap there
-/// but not all sequences do (it's variable).
+/// Compute `max_gaps` for an atom run, matching `libsrc/atom.c::ReadAtoms`:
+/// the maximum number of gaps any single training sequence carries within the
+/// atom's columns. (The previous implementation counted the number of *columns*
+/// containing at least one gap, which inflated `max_gaps` when gaps were
+/// distributed across sequences and produced a different config space than C.)
 fn compute_strand_gaps(ts: &TrainingSet, run: &Run) -> usize {
-    let mut gap_cols = 0;
-    for col in run.start_col..run.end_col() {
-        let gap_count = ts
-            .sequences
-            .iter()
-            .filter(|seq| seq[col] == b'-')
+    let mut max_gaps = 0;
+    for seq in &ts.sequences {
+        let gaps = (run.start_col..run.end_col())
+            .filter(|&col| seq[col] == b'-')
             .count();
-        // Variable gap: some have gaps, some don't. Or all have gaps (void column).
-        if gap_count > 0 {
-            gap_cols += 1;
+        if gaps > max_gaps {
+            max_gaps = gaps;
         }
     }
-    gap_cols
+    max_gaps
 }
 
 #[cfg(test)]

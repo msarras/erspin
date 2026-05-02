@@ -185,6 +185,42 @@ fn parse_background_mode(s: &str) -> Result<BackgroundMode, String> {
     }
 }
 
+/// Compute ATGC background frequencies across the concatenated database.
+///
+/// Matches C ERPIN's behaviour: counts A/T/G/C across all bases (case-insensitive)
+/// and reports the relative frequency. Falls back to uniform when no scoreable
+/// bases are present.
+fn background_from_sequences(sequences: &[Sequence]) -> Background {
+    let mut counts = [0u64; 4];
+    let mut total = 0u64;
+    for seq in sequences {
+        for &b in &seq.data {
+            let idx = match b {
+                b'A' | b'a' => Some(0),
+                b'T' | b't' | b'U' | b'u' => Some(1),
+                b'G' | b'g' => Some(2),
+                b'C' | b'c' => Some(3),
+                _ => None,
+            };
+            if let Some(i) = idx {
+                counts[i] += 1;
+                total += 1;
+            }
+        }
+    }
+    if total == 0 {
+        return Background::default();
+    }
+    Background {
+        freq: [
+            counts[0] as f64 / total as f64,
+            counts[1] as f64 / total as f64,
+            counts[2] as f64 / total as f64,
+            counts[3] as f64 / total as f64,
+        ],
+    }
+}
+
 /// Convert --add groups into MaskSpec entries.
 /// Each --add value is a comma-separated list of element numbers.
 /// First group → Mask mode (specific elements), subsequent → Add mode (cumulative).
@@ -233,7 +269,7 @@ fn main() -> Result<()> {
             processing: _processing,
             strand,
             output: output_style,
-            background: _background,
+            background,
             pseudo_count,
             format: output_format,
             cpu,
@@ -252,8 +288,22 @@ fn main() -> Result<()> {
             let mask_specs = add_groups_to_mask_specs(&add)
                 .context("parsing --add mask levels")?;
 
+            // Load database first so we can compute database-wide background
+            // frequencies (matches C ERPIN's "ATGC ratios" computation).
+            let reader = FastaReader::from_path(&database)
+                .with_context(|| format!("opening database '{}'", database))?;
+            let sequences = reader
+                .collect_all()
+                .with_context(|| format!("reading database '{}'", database))?;
+            let total_bases: usize = sequences.iter().map(|s| s.len()).sum();
+
             // Build pattern with profiles.
-            let bg = Background::default();
+            let bg = match background {
+                BackgroundMode::Uniform => Background::default(),
+                BackgroundMode::Global | BackgroundMode::Local => {
+                    background_from_sequences(&sequences)
+                }
+            };
             let pat = pattern::build_pattern(&ts, &reg, &bg, pseudo_count, logzero);
 
             eprintln!(
@@ -265,6 +315,10 @@ fn main() -> Result<()> {
                 pat.helices.len(),
                 pat.strands.len(),
                 pat.atoms.len()
+            );
+            eprintln!(
+                "  ATGC background: {:.3}  {:.3}  {:.3}  {:.3}",
+                bg.freq[0], bg.freq[1], bg.freq[2], bg.freq[3]
             );
 
             // Resolve masks and compute thresholds.
@@ -287,14 +341,6 @@ fn main() -> Result<()> {
                 );
             }
 
-            // Load database and search.
-            let reader = FastaReader::from_path(&database)
-                .with_context(|| format!("opening database '{}'", database))?;
-            let sequences = reader
-                .collect_all()
-                .with_context(|| format!("reading database '{}'", database))?;
-
-            let total_bases: usize = sequences.iter().map(|s| s.len()).sum();
             eprintln!(
                 "Database: {:?}\n  {} nucleotides in {} sequence(s)",
                 database, total_bases, sequences.len()

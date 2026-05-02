@@ -1,6 +1,23 @@
+use std::cell::RefCell;
+use std::sync::Arc;
+
 use crate::scoring;
 use crate::types::*;
 use rayon::prelude::*;
+
+thread_local! {
+    /// Per-thread reusable reverse-complement buffer. `search_full` populates
+    /// this for each `RC` pass instead of allocating a fresh Vec.
+    static RC_BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+
+    /// Per-thread scratch score tables. `scan_level` fills this in-place each
+    /// time it runs so the per-element / per-gap-variant `Vec<f32>` buffers
+    /// stay hot across thousands of chunks instead of being reallocated.
+    static SCRATCH_TABLES: RefCell<scoring::ScoreTables> = RefCell::new(scoring::ScoreTables {
+        helix_scores: Vec::new(),
+        strand_scores: Vec::new(),
+    });
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Mask Resolution
@@ -70,27 +87,53 @@ pub fn resolve_masks(specs: &[MaskSpec], pattern: &Pattern) -> Vec<ResolvedMask>
             .map(|(i, _)| i)
             .collect();
 
+        // Build inverse maps for O(1) element-index lookups in the hot path
+        // (build_config_from_gaps + collect_gap_variables previously did
+        // O(n) iter().position() per atom — those are now O(1)).
+        let mut hx_inv: Vec<Option<usize>> = vec![None; pattern.helices.len()];
+        for (mi, &hi) in hx_indices.iter().enumerate() {
+            hx_inv[hi] = Some(mi);
+        }
+        let mut st_inv: Vec<Option<usize>> = vec![None; pattern.strands.len()];
+        for (mi, &si) in st_indices.iter().enumerate() {
+            st_inv[si] = Some(mi);
+        }
+
+        let in_mask: Vec<bool> = pattern
+            .atoms
+            .iter()
+            .map(|atom| match atom.atom_type {
+                AtomType::Helix1 | AtomType::Helix2 => hx_inv[atom.element_index].is_some(),
+                AtomType::Strand => st_inv[atom.element_index].is_some(),
+            })
+            .collect();
+        let first_atom = in_mask.iter().position(|&m| m).unwrap_or(0);
+        let last_atom = in_mask.iter().rposition(|&m| m).unwrap_or(0);
+
+        let gap_vars = collect_gap_variables(pattern, &in_mask, first_atom, last_atom);
+
         // Precompute configs if the count is manageable. Otherwise, leave
         // configs empty; the search will use DMP (per-hit constrained config
         // generation) for that level.
-        let configs = if level == 0 {
-            generate_configs(pattern, &hx_indices, &st_indices)
+        let total: usize = gap_vars
+            .iter()
+            .map(|v| v.max_gaps + 1)
+            .product::<usize>()
+            .max(1);
+        let configs = if level == 0 || total <= 100_000 {
+            generate_configs(
+                pattern,
+                &hx_indices,
+                &st_indices,
+                &hx_inv,
+                &st_inv,
+                &in_mask,
+                first_atom,
+                last_atom,
+                &gap_vars,
+            )
         } else {
-            let in_mask = build_atom_membership(pattern, &hx_indices, &st_indices);
-            let first = in_mask.iter().position(|&m| m).unwrap_or(0);
-            let last = in_mask.iter().rposition(|&m| m).unwrap_or(0);
-            let gap_vars =
-                collect_gap_variables(pattern, &st_indices, &in_mask, first, last);
-            let total: usize = gap_vars
-                .iter()
-                .map(|v| v.max_gaps + 1)
-                .product::<usize>()
-                .max(1);
-            if total <= 100_000 {
-                generate_configs(pattern, &hx_indices, &st_indices)
-            } else {
-                Vec::new() // DMP will handle this level
-            }
+            Vec::new() // DMP will handle this level
         };
         let (min_bgn, max_bgn, min_len, max_len) =
             compute_mask_geometry(pattern, &hx_indices, &st_indices);
@@ -104,6 +147,12 @@ pub fn resolve_masks(specs: &[MaskSpec], pattern: &Pattern) -> Vec<ResolvedMask>
             max_bgn,
             min_len,
             max_len,
+            in_mask,
+            first_atom,
+            last_atom,
+            hx_inv,
+            st_inv,
+            gap_vars,
         });
     }
 
@@ -120,7 +169,11 @@ pub fn compute_thresholds(
     masks: &mut [ResolvedMask],
     cutoffs: &[String],
 ) {
-    for (i, mask) in masks.iter_mut().enumerate() {
+    // Masks are independent → process in parallel. Within each mask, training
+    // sequences are independent too, so the inner score computation also runs
+    // in parallel via `par_iter`. Rayon's work-stealing handles the nested
+    // parallelism without oversubscription.
+    masks.par_iter_mut().enumerate().for_each(|(i, mask)| {
         let cutoff_str = cutoffs.get(i).map_or("100%", String::as_str);
 
         if let Some(pct_str) = cutoff_str.strip_suffix('%') {
@@ -128,38 +181,32 @@ pub fn compute_thresholds(
 
             let mut scores: Vec<f64> = ts
                 .sequences
-                .iter()
+                .par_iter()
                 .map(|seq| scoring::score_training_sequence(seq, pattern, mask))
                 .collect();
             scores.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
 
-            let idx = if pct >= 100.0 {
-                0
-            } else {
-                let n = (scores.len() as f64 * (1.0 - pct / 100.0)).ceil() as usize;
-                n.min(scores.len() - 1)
-            };
-            mask.threshold = scores[idx] - 0.001;
+            // Mirror C ERPIN's `ConvertRatio` (libsrc/tscores.c:262): walk
+            // sorted-ascending scores, take the first index `j` where
+            // round(100 * (N - j) / N) <= percent, and return ts_scores[j-1]
+            // (or ts_scores[0] if j == 0). The original Rust used a simpler
+            // `ceil((1 - pct/100) * N)` formula which is off-by-one vs C and
+            // produced a slightly stricter threshold.
+            let n_scores = scores.len();
+            let percent = pct as i32;
+            let mut idx = n_scores - 1; // initial: highest (= "% minimal")
+            for j in 0..n_scores {
+                let ratio = ((100.0 * (n_scores - j) as f64 / n_scores as f64).round()) as i32;
+                if ratio <= percent {
+                    idx = if j > 0 { j - 1 } else { 0 };
+                    break;
+                }
+            }
+            mask.threshold = scores[idx] - 1e-3;
         } else {
             mask.threshold = cutoff_str.parse().unwrap_or(0.0);
         }
-    }
-}
-
-/// Build a bitmask of which atoms are included in this mask.
-fn build_atom_membership(
-    pattern: &Pattern,
-    hx_indices: &[usize],
-    st_indices: &[usize],
-) -> Vec<bool> {
-    pattern
-        .atoms
-        .iter()
-        .map(|atom| match atom.atom_type {
-            AtomType::Helix1 | AtomType::Helix2 => hx_indices.contains(&atom.element_index),
-            AtomType::Strand => st_indices.contains(&atom.element_index),
-        })
-        .collect()
+    });
 }
 
 /// Generate all valid gap configurations for a mask.
@@ -170,58 +217,54 @@ fn build_atom_membership(
 ///   gap variables
 /// - Helix gap variants are derived from the gaps of intervening atoms,
 ///   not enumerated independently
+#[allow(clippy::too_many_arguments)]
 fn generate_configs(
     pattern: &Pattern,
     hx_indices: &[usize],
     st_indices: &[usize],
+    hx_inv: &[Option<usize>],
+    st_inv: &[Option<usize>],
+    in_mask: &[bool],
+    first_mask: usize,
+    last_mask: usize,
+    gap_vars: &[GapVar],
 ) -> Vec<Config> {
     let nhx = hx_indices.len();
     let nst = st_indices.len();
 
-    if pattern.atoms.is_empty() {
+    if pattern.atoms.is_empty() || !in_mask.iter().any(|&m| m) {
         return vec![Config {
             len: 0,
             st_bgn: vec![0; nst],
             st_gaps: vec![0; nst],
             hx_bgn: vec![0; nhx],
             hx_gaps: vec![0; nhx],
-            atom_gaps: Vec::new(),
+            atom_gaps: Arc::from(vec![0usize; pattern.atoms.len()].into_boxed_slice()),
         }];
     }
-
-    let in_mask = build_atom_membership(pattern, hx_indices, st_indices);
-
-    let Some(first_mask) = in_mask.iter().position(|&m| m) else {
-        return vec![Config {
-            len: 0,
-            st_bgn: vec![0; nst],
-            st_gaps: vec![0; nst],
-            hx_bgn: vec![0; nhx],
-            hx_gaps: vec![0; nhx],
-            atom_gaps: vec![0; pattern.atoms.len()],
-        }];
-    };
-    let last_mask = in_mask.iter().rposition(|&m| m).unwrap();
-
-    // Identify gap variables by walking the mask envelope.
-    let gap_vars = collect_gap_variables(pattern, st_indices, &in_mask, first_mask, last_mask);
 
     // Enumerate all combinations of gap variable values.
     let ranges: Vec<usize> = gap_vars.iter().map(|v| v.max_gaps + 1).collect();
     let total: usize = ranges.iter().copied().product::<usize>().max(1);
     let mut configs = Vec::with_capacity(total);
 
-    for combo_idx in 0..total {
-        let gap_values = decode_combination(combo_idx, &ranges);
+    let natoms = pattern.atoms.len();
+    let mut atom_gaps = vec![0usize; natoms];
+    let mut gap_values = vec![0usize; gap_vars.len()];
 
-        let atom_gaps =
-            distribute_gaps(pattern, &gap_vars, &gap_values, pattern.atoms.len());
+    for combo_idx in 0..total {
+        decode_combination_into(combo_idx, &ranges, &mut gap_values);
+
+        atom_gaps.iter_mut().for_each(|g| *g = 0);
+        distribute_gaps_into(pattern, gap_vars, &gap_values, &mut atom_gaps);
 
         let config = build_config_from_gaps(
             pattern,
-            hx_indices,
-            st_indices,
-            &in_mask,
+            nhx,
+            nst,
+            hx_inv,
+            st_inv,
+            in_mask,
             &atom_gaps,
             first_mask,
             last_mask,
@@ -240,33 +283,31 @@ fn generate_configs(
 /// `prev_first..=prev_last` are fixed; others are enumerated freely.
 fn generate_configs_constrained(
     pattern: &Pattern,
-    hx_indices: &[usize],
-    st_indices: &[usize],
+    mask: &ResolvedMask,
     prev_atom_gaps: &[usize],
     prev_first: usize,
     prev_last: usize,
 ) -> Vec<Config> {
-    let nhx = hx_indices.len();
-    let nst = st_indices.len();
+    let nhx = mask.hx_indices.len();
+    let nst = mask.st_indices.len();
+    let in_mask = &mask.in_mask;
+    let first_mask = mask.first_atom;
+    let last_mask = mask.last_atom;
+    let gap_vars = &mask.gap_vars;
 
-    let in_mask = build_atom_membership(pattern, hx_indices, st_indices);
-
-    let Some(first_mask) = in_mask.iter().position(|&m| m) else {
+    if !in_mask.iter().any(|&m| m) {
         return vec![Config {
             len: 0,
             st_bgn: vec![0; nst],
             st_gaps: vec![0; nst],
             hx_bgn: vec![0; nhx],
             hx_gaps: vec![0; nhx],
-            atom_gaps: vec![0; pattern.atoms.len()],
+            atom_gaps: Arc::from(vec![0usize; pattern.atoms.len()].into_boxed_slice()),
         }];
-    };
-    let last_mask = in_mask.iter().rposition(|&m| m).unwrap();
-
-    let gap_vars = collect_gap_variables(pattern, st_indices, &in_mask, first_mask, last_mask);
+    }
 
     // Split variables into fixed (within previous envelope) and free.
-    let mut free_indices = Vec::new();
+    let mut free_indices = Vec::with_capacity(gap_vars.len());
     let mut fixed_values = vec![0usize; gap_vars.len()];
 
     for (vi, var) in gap_vars.iter().enumerate() {
@@ -282,25 +323,34 @@ fn generate_configs_constrained(
         }
     }
 
-    let free_ranges: Vec<usize> = free_indices.iter().map(|&i| gap_vars[i].max_gaps + 1).collect();
+    let free_ranges: Vec<usize> =
+        free_indices.iter().map(|&i| gap_vars[i].max_gaps + 1).collect();
     let total: usize = free_ranges.iter().copied().product::<usize>().max(1);
     let mut configs = Vec::with_capacity(total);
 
-    for combo_idx in 0..total {
-        let free_values = decode_combination(combo_idx, &free_ranges);
+    let natoms = pattern.atoms.len();
+    let mut gap_values = fixed_values.clone();
+    let mut free_values = vec![0usize; free_indices.len()];
+    let mut atom_gaps = vec![0usize; natoms];
 
-        let mut gap_values = fixed_values.clone();
+    for combo_idx in 0..total {
+        decode_combination_into(combo_idx, &free_ranges, &mut free_values);
+
+        // Reset gap_values to fixed_values (only the free positions change).
         for (fi, &vi) in free_indices.iter().enumerate() {
             gap_values[vi] = free_values[fi];
         }
 
-        let atom_gaps = distribute_gaps(pattern, &gap_vars, &gap_values, pattern.atoms.len());
+        atom_gaps.iter_mut().for_each(|g| *g = 0);
+        distribute_gaps_into(pattern, gap_vars, &gap_values, &mut atom_gaps);
 
         let config = build_config_from_gaps(
             pattern,
-            hx_indices,
-            st_indices,
-            &in_mask,
+            nhx,
+            nst,
+            &mask.hx_inv,
+            &mask.st_inv,
+            in_mask,
             &atom_gaps,
             first_mask,
             last_mask,
@@ -311,40 +361,26 @@ fn generate_configs_constrained(
     configs
 }
 
-/// A gap variable represents a degree of freedom in the gap configuration.
-struct GapVar {
-    max_gaps: usize,
-    /// Atom index range (inclusive start, exclusive end).
-    atom_range: (usize, usize),
-    /// If this is a single mask strand atom, its index in st_indices.
-    _mask_strand: Option<usize>,
-    /// Whether this variable applies to a single mask strand atom.
-    is_mask_strand: bool,
-}
-
 /// Walk the mask envelope and collect gap variables.
 fn collect_gap_variables(
     pattern: &Pattern,
-    st_indices: &[usize],
     in_mask: &[bool],
     first: usize,
     last: usize,
 ) -> Vec<GapVar> {
     let mut vars = Vec::new();
+    if !in_mask.iter().any(|&m| m) {
+        return vars;
+    }
     let mut ai = first;
 
     while ai <= last {
         if in_mask[ai] {
             let atom = &pattern.atoms[ai];
             if atom.atom_type == AtomType::Strand && atom.max_gaps > 0 {
-                let st_mask_idx = st_indices
-                    .iter()
-                    .position(|&si| si == atom.element_index)
-                    .unwrap();
                 vars.push(GapVar {
                     max_gaps: atom.max_gaps,
                     atom_range: (ai, ai + 1),
-                    _mask_strand: Some(st_mask_idx),
                     is_mask_strand: true,
                 });
             }
@@ -360,7 +396,6 @@ fn collect_gap_variables(
                 vars.push(GapVar {
                     max_gaps: cum_gaps,
                     atom_range: (group_start, ai),
-                    _mask_strand: None,
                     is_mask_strand: false,
                 });
             }
@@ -370,24 +405,24 @@ fn collect_gap_variables(
     vars
 }
 
-/// Decode a linear combination index into per-variable gap values.
-fn decode_combination(mut combo_idx: usize, ranges: &[usize]) -> Vec<usize> {
-    let mut values = vec![0usize; ranges.len()];
+/// Decode a linear combination index into a caller-provided slot, avoiding
+/// the per-call Vec allocation.
+fn decode_combination_into(mut combo_idx: usize, ranges: &[usize], values: &mut [usize]) {
+    debug_assert_eq!(values.len(), ranges.len());
     for i in (0..ranges.len()).rev() {
         values[i] = combo_idx % ranges[i];
         combo_idx /= ranges[i];
     }
-    values
 }
 
-/// Distribute gap variable values to individual atoms.
-fn distribute_gaps(
+/// Distribute gap variable values into a caller-provided `atom_gaps` buffer.
+/// The buffer must already be zeroed for atoms touched by no variable.
+fn distribute_gaps_into(
     pattern: &Pattern,
     gap_vars: &[GapVar],
     gap_values: &[usize],
-    natoms: usize,
-) -> Vec<usize> {
-    let mut atom_gaps = vec![0usize; natoms];
+    atom_gaps: &mut [usize],
+) {
     for (vi, var) in gap_vars.iter().enumerate() {
         let val = gap_values[vi];
         if var.is_mask_strand {
@@ -401,24 +436,28 @@ fn distribute_gaps(
             }
         }
     }
-    atom_gaps
 }
 
 /// Walk the mask envelope and build a Config from per-atom gap assignments.
+/// Uses precomputed inverse-index slices (`hx_inv`, `st_inv`) so element
+/// position lookups are O(1) instead of O(mask elements).
+#[allow(clippy::too_many_arguments)]
 fn build_config_from_gaps(
     pattern: &Pattern,
-    hx_indices: &[usize],
-    st_indices: &[usize],
+    nhx: usize,
+    nst: usize,
+    hx_inv: &[Option<usize>],
+    st_inv: &[Option<usize>],
     in_mask: &[bool],
     atom_gaps: &[usize],
     first: usize,
     last: usize,
 ) -> Config {
     let mut pos = 0usize;
-    let mut hx_bgn = vec![0usize; hx_indices.len()];
-    let mut hx_gaps = vec![0usize; hx_indices.len()];
-    let mut st_bgn = vec![0usize; st_indices.len()];
-    let mut st_gaps = vec![0usize; st_indices.len()];
+    let mut hx_bgn = vec![0usize; nhx];
+    let mut hx_gaps = vec![0usize; nhx];
+    let mut st_bgn = vec![0usize; nst];
+    let mut st_gaps = vec![0usize; nst];
 
     for ai in first..=last {
         let atom = &pattern.atoms[ai];
@@ -426,25 +465,19 @@ fn build_config_from_gaps(
         if in_mask[ai] {
             match atom.atom_type {
                 AtomType::Helix1 => {
-                    if let Some(mi) =
-                        hx_indices.iter().position(|&hi| hi == atom.element_index)
-                    {
+                    if let Some(mi) = hx_inv[atom.element_index] {
                         hx_bgn[mi] = pos;
                     }
                 }
                 AtomType::Helix2 => {
-                    if let Some(mi) =
-                        hx_indices.iter().position(|&hi| hi == atom.element_index)
-                    {
+                    if let Some(mi) = hx_inv[atom.element_index] {
                         let helix = &pattern.helices[atom.element_index];
                         let hlx1_end = hx_bgn[mi] + helix.helix_len;
                         hx_gaps[mi] = pos - hlx1_end - helix.min_dist;
                     }
                 }
                 AtomType::Strand => {
-                    if let Some(mi) =
-                        st_indices.iter().position(|&si| si == atom.element_index)
-                    {
+                    if let Some(mi) = st_inv[atom.element_index] {
                         st_bgn[mi] = pos;
                         st_gaps[mi] = atom_gaps[ai];
                     }
@@ -461,7 +494,7 @@ fn build_config_from_gaps(
         st_gaps,
         hx_bgn,
         hx_gaps,
-        atom_gaps: atom_gaps.to_vec(),
+        atom_gaps: Arc::from(atom_gaps.to_vec().into_boxed_slice()),
     }
 }
 
@@ -507,14 +540,6 @@ fn compute_mask_geometry(
 // Cascade Search
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Compute the atom envelope (first, last atom indices) for a mask.
-fn atom_envelope(pattern: &Pattern, mask: &ResolvedMask) -> (usize, usize) {
-    let in_mask = build_atom_membership(pattern, &mask.hx_indices, &mask.st_indices);
-    let first = in_mask.iter().position(|&m| m).unwrap_or(0);
-    let last = in_mask.iter().rposition(|&m| m).unwrap_or(0);
-    (first, last)
-}
-
 /// Search a single sequence with a multi-level mask cascade.
 ///
 /// Level 0 uses precomputed configs (SMP). Levels 1+ use dynamic mask
@@ -551,7 +576,8 @@ pub fn search_sequence(
         } else {
             // DMP: generate constrained configs per-hit and score directly.
             let prev_mask = &masks[level - 1];
-            let (prev_first, prev_last) = atom_envelope(pattern, prev_mask);
+            let prev_first = prev_mask.first_atom;
+            let prev_last = prev_mask.last_atom;
 
             // DMP hits are independent — process in parallel.
             let next_hits: Vec<Hit> = current_hits
@@ -559,8 +585,7 @@ pub fn search_sequence(
                 .filter_map(|hit| {
                     let constrained_configs = generate_configs_constrained(
                         pattern,
-                        &next_mask.hx_indices,
-                        &next_mask.st_indices,
+                        next_mask,
                         &hit.atom_gaps,
                         prev_first,
                         prev_last,
@@ -570,27 +595,22 @@ pub fn search_sequence(
                         return None;
                     }
 
-                    let tmp_mask = ResolvedMask {
-                        hx_indices: next_mask.hx_indices.clone(),
-                        st_indices: next_mask.st_indices.clone(),
-                        configs: constrained_configs,
-                        threshold: next_mask.threshold,
-                        min_bgn: next_mask.min_bgn,
-                        max_bgn: next_mask.max_bgn,
-                        min_len: next_mask.min_len,
-                        max_len: next_mask.max_len,
-                    };
-
-                    let (score, cfg_idx) =
-                        scoring::score_configs_direct(seq_data, pattern, &tmp_mask, hit.offset);
-                    (score > tmp_mask.threshold).then(|| Hit {
+                    let (score, cfg_idx) = scoring::score_configs_direct_with(
+                        seq_data,
+                        pattern,
+                        next_mask,
+                        &constrained_configs,
+                        hit.offset,
+                        next_mask.threshold,
+                    );
+                    (score > next_mask.threshold).then(|| Hit {
                         offset: hit.offset,
-                        length: tmp_mask.configs[cfg_idx].len,
+                        length: constrained_configs[cfg_idx].len,
                         score,
                         evalue: None,
                         direction: StrandDirection::Forward,
                         config_index: cfg_idx,
-                        atom_gaps: tmp_mask.configs[cfg_idx].atom_gaps.clone(),
+                        atom_gaps: Arc::clone(&constrained_configs[cfg_idx].atom_gaps),
                     })
                 })
                 .collect();
@@ -598,7 +618,7 @@ pub fn search_sequence(
         }
     }
 
-    overlap_filter(&current_hits, direction)
+    overlap_filter(current_hits, direction)
 }
 
 /// Scan a range of positions at a single mask level.
@@ -619,23 +639,26 @@ fn scan_level(
     };
     let scan_len = scan_len + 1;
 
-    let tables = scoring::compute_mask_score_tables(window, pattern, mask);
-    let lookup = scoring::ConfigLookup::build(mask, &tables);
+    SCRATCH_TABLES.with(|cell| {
+        let mut tables = cell.borrow_mut();
+        scoring::compute_mask_score_tables_into(window, pattern, mask, &mut tables);
+        let lookup = scoring::ConfigLookup::build(mask, &tables);
 
-    (0..scan_len)
-        .filter_map(|pos| {
-            let (score, cfg_idx) = lookup.best_score_threshold(pos, mask.threshold);
-            (score > mask.threshold).then(|| Hit {
-                offset: range_start + pos,
-                length: lookup.config_len(cfg_idx),
-                score,
-                evalue: None,
-                direction: StrandDirection::Forward,
-                config_index: cfg_idx,
-                atom_gaps: mask.configs[cfg_idx].atom_gaps.clone(),
+        (0..scan_len)
+            .filter_map(|pos| {
+                let (score, cfg_idx) = lookup.best_score_threshold(pos, mask.threshold);
+                (score > mask.threshold).then(|| Hit {
+                    offset: range_start + pos,
+                    length: lookup.config_len(cfg_idx),
+                    score,
+                    evalue: None,
+                    direction: StrandDirection::Forward,
+                    config_index: cfg_idx,
+                    atom_gaps: Arc::clone(&mask.configs[cfg_idx].atom_gaps),
+                })
             })
-        })
-        .collect()
+            .collect()
+    })
 }
 
 
@@ -644,30 +667,34 @@ fn scan_level(
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Remove overlapping hits, keeping the highest-scoring one in each group.
-fn overlap_filter(hits: &[Hit], direction: StrandDirection) -> Vec<Hit> {
+///
+/// Takes ownership of the input Vec so the upfront `to_vec()` is gone — for
+/// a 100k-hit chunk this drops one big clone pass. The per-group `clone` of
+/// the chosen Hit remains, but with `atom_gaps` shared via `Arc<[usize]>`
+/// each clone is now a small memcpy + a refcount bump.
+fn overlap_filter(mut hits: Vec<Hit>, direction: StrandDirection) -> Vec<Hit> {
     if hits.is_empty() {
-        return Vec::new();
+        return hits;
     }
 
-    let mut sorted: Vec<Hit> = hits.to_vec();
-    sorted.sort_unstable_by_key(|h| h.offset);
+    hits.sort_unstable_by_key(|h| h.offset);
 
-    let mut result = Vec::new();
+    let mut result = Vec::with_capacity(hits.len());
     let mut i = 0;
 
-    while i < sorted.len() {
+    while i < hits.len() {
         let mut best_idx = i;
-        let end_of_first = sorted[i].offset + sorted[i].length;
+        let end_of_first = hits[i].offset + hits[i].length;
 
         let mut j = i + 1;
-        while j < sorted.len() && sorted[j].offset < end_of_first {
-            if sorted[j].score > sorted[best_idx].score {
+        while j < hits.len() && hits[j].offset < end_of_first {
+            if hits[j].score > hits[best_idx].score {
                 best_idx = j;
             }
             j += 1;
         }
 
-        let mut hit = sorted[best_idx].clone();
+        let mut hit = hits[best_idx].clone();
         hit.direction = direction;
         result.push(hit);
         i = j;
@@ -763,7 +790,7 @@ fn search_sequence_chunked(
         .collect();
 
     let merged: Vec<Hit> = chunk_hits.into_iter().flatten().collect();
-    overlap_filter(&merged, direction)
+    overlap_filter(merged, direction)
 }
 
 /// Run a full search: forward, reverse, or both strands.
@@ -785,9 +812,15 @@ pub fn search_full(
     }
 
     if matches!(direction, StrandDirection::Reverse | StrandDirection::Both) {
-        let rc = seq.reverse_complement();
         let seq_len = seq.len();
-        let mut hits = search_sequence_chunked(pattern, masks, &rc, StrandDirection::Reverse);
+        // Reuse a per-thread reverse-complement buffer instead of allocating
+        // a fresh Vec<u8> per sequence. On a 1 GB FASTA scanned across N
+        // threads this trades millions of small allocations for N grows.
+        let mut hits = RC_BUFFER.with(|cell| {
+            let mut rc = cell.borrow_mut();
+            seq.reverse_complement_into(&mut rc);
+            search_sequence_chunked(pattern, masks, &rc, StrandDirection::Reverse)
+        });
         for hit in &mut hits {
             hit.offset = seq_len - hit.offset - hit.length;
         }
