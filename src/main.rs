@@ -33,9 +33,9 @@ enum Commands {
         #[arg(allow_hyphen_values = true)]
         region: String,
 
-        /// Mask level elements (comma-separated). Each --add starts a new level.
+        /// Mask level elements (space- or comma-separated). Each --add starts a new level.
         /// First group is the initial mask, subsequent groups add elements cumulatively.
-        /// Example: --add 2,4,5,6 --add 3,8,9,10
+        /// Example: --add 2 4 5 6 --add 3 8 9 10  (or --add 2,4,5,6 --add 3,8,9,10)
         #[arg(long = "add")]
         add: Vec<String>,
 
@@ -96,7 +96,7 @@ enum Commands {
         #[arg(allow_hyphen_values = true)]
         region: String,
 
-        /// Mask level elements (comma-separated). Each --add starts a new level.
+        /// Mask level elements (space- or comma-separated). Each --add starts a new level.
         #[arg(long = "add")]
         add: Vec<String>,
     },
@@ -110,7 +110,7 @@ enum Commands {
         #[arg(allow_hyphen_values = true)]
         region: String,
 
-        /// Mask level elements (comma-separated). Each --add starts a new level.
+        /// Mask level elements (space- or comma-separated). Each --add starts a new level.
         #[arg(long = "add")]
         add: Vec<String>,
 
@@ -132,7 +132,7 @@ enum Commands {
         #[arg(allow_hyphen_values = true)]
         region: String,
 
-        /// Mask level elements (comma-separated). Each --add starts a new level.
+        /// Mask level elements (space- or comma-separated). Each --add starts a new level.
         #[arg(long = "add")]
         add: Vec<String>,
     },
@@ -222,7 +222,9 @@ fn background_from_sequences(sequences: &[Sequence]) -> Background {
 }
 
 /// Convert --add groups into MaskSpec entries.
-/// Each --add value is a comma-separated list of element numbers.
+/// Each --add value is a comma-separated list of element numbers
+/// (space-separated tokens are folded into the same group by `coalesce_add_argv`
+/// before clap parses them).
 /// First group → Mask mode (specific elements), subsequent → Add mode (cumulative).
 /// If no groups provided, defaults to NoMask (all elements).
 fn add_groups_to_mask_specs(add: &[String]) -> Result<Vec<MaskSpec>> {
@@ -253,10 +255,113 @@ fn add_groups_to_mask_specs(add: &[String]) -> Result<Vec<MaskSpec>> {
     Ok(specs)
 }
 
+/// Preprocess argv so that space-separated values after `--add` are folded
+/// into a single comma-separated value, matching the legacy `--add a,b,c`
+/// shape that clap's derive expects.
+///
+/// `--add 5 6 7 --add 4 8 10 12 13 --logzero -3 --cutoff 4 8 10 20`
+///   → `--add 5,6,7 --add 4,8,10,12,13 --logzero -3 --cutoff 4 8 10 20`
+///
+/// Already-comma-separated input passes through unchanged. Only `--add`
+/// (long form) is rewritten — the boundary is the next argv token that
+/// starts with `-` (i.e. another flag) or end-of-argv. Element numbers are
+/// always positive integers, so a leading `-` unambiguously marks a flag.
+fn coalesce_add_argv<I, S>(args: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut out = Vec::new();
+    let mut iter = args.into_iter().map(Into::into).peekable();
+    while let Some(arg) = iter.next() {
+        if arg == "--add" {
+            out.push(arg);
+            let mut group: Vec<String> = Vec::new();
+            while let Some(next) = iter.peek() {
+                if next.starts_with('-') {
+                    break;
+                }
+                group.push(iter.next().unwrap());
+            }
+            // If user wrote `--add` with no following values, push nothing
+            // and let clap report the missing-value error itself.
+            if !group.is_empty() {
+                out.push(group.join(","));
+            }
+        } else {
+            out.push(arg);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod argv_tests {
+    use super::coalesce_add_argv;
+
+    fn run(args: &[&str]) -> Vec<String> {
+        coalesce_add_argv(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn space_separated_groups_collapse_to_commas() {
+        assert_eq!(
+            run(&[
+                "erspin", "search", "x.epn", "db.fa", "1,24",
+                "--add", "5", "6", "7",
+                "--add", "4", "8", "10", "12", "13",
+                "--logzero", "-3",
+                "--cutoff", "4", "8", "10", "20",
+            ]),
+            vec![
+                "erspin", "search", "x.epn", "db.fa", "1,24",
+                "--add", "5,6,7",
+                "--add", "4,8,10,12,13",
+                "--logzero", "-3",
+                "--cutoff", "4", "8", "10", "20",
+            ],
+        );
+    }
+
+    #[test]
+    fn comma_separated_input_passes_through() {
+        assert_eq!(
+            run(&["--add", "5,6,7", "--add", "4,8"]),
+            vec!["--add", "5,6,7", "--add", "4,8"],
+        );
+    }
+
+    #[test]
+    fn mixed_form_concatenates_with_commas() {
+        // `--add 5 6,7 --add 4` → `--add 5,6,7 --add 4`
+        assert_eq!(
+            run(&["--add", "5", "6,7", "--add", "4"]),
+            vec!["--add", "5,6,7", "--add", "4"],
+        );
+    }
+
+    #[test]
+    fn empty_add_passes_through_for_clap_to_error() {
+        // `--add --logzero -3` — no values; we don't synthesise one.
+        assert_eq!(
+            run(&["--add", "--logzero", "-3"]),
+            vec!["--add", "--logzero", "-3"],
+        );
+    }
+
+    #[test]
+    fn non_add_args_untouched() {
+        assert_eq!(
+            run(&["--cutoff", "4", "8", "10", "20"]),
+            vec!["--cutoff", "4", "8", "10", "20"],
+        );
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(coalesce_add_argv(std::env::args()));
 
     match cli.command {
         Commands::Search {
